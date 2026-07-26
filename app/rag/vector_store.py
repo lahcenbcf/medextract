@@ -94,3 +94,44 @@ def delete_by_metadata(metadata: Dict[str, Any]) -> None:
         return
     ensure_collection()
     get_client().delete(collection_name=COLLECTION, points_selector=flt)
+
+
+def list_sources() -> List[Dict[str, Any]]:
+    """
+    List indexed documents grouped by their `source` (the uploaded filename),
+    with a chunk count and the tags they carry. Scrolls the whole collection —
+    fine for the modest Knowledge Base sizes we deal with.
+    """
+    client = get_client()
+    if not client.collection_exists(COLLECTION):
+        return []
+
+    grouped: Dict[str, Dict[str, Any]] = {}
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=COLLECTION,
+            with_payload=True,
+            with_vectors=False,
+            limit=256,
+            offset=offset,
+        )
+        for p in points:
+            payload = p.payload or {}
+            source = payload.get("source") or "(sans nom)"
+            entry = grouped.get(source)
+            if entry is None:
+                entry = {
+                    "source": source,
+                    "chunks": 0,
+                    "module": payload.get("module"),
+                    "year": payload.get("year"),
+                    "type": payload.get("type"),
+                    "course": payload.get("course"),
+                }
+                grouped[source] = entry
+            entry["chunks"] += 1
+        if offset is None:
+            break
+
+    return sorted(grouped.values(), key=lambda e: e["source"].lower())

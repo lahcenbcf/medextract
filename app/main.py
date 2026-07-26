@@ -39,6 +39,7 @@ from app.llm.correction_graph import (
 )
 from app.rag.ingest import ingest_text, retrieve
 from app.rag.jobs import create_job, get_job, update_job
+from app.rag.vector_store import delete_by_metadata, list_sources
 
 
 @asynccontextmanager
@@ -315,6 +316,34 @@ def rag_search(req: RagSearchRequest):
     except Exception as exc:
         print(f"[rag/search] failed: {exc}")
         raise HTTPException(status_code=502, detail="Search failed") from exc
+
+
+@app.get("/rag/sources")
+def rag_sources():
+    """List indexed documents (grouped by source) for the KB management UI."""
+    try:
+        return {"sources": list_sources()}
+    except Exception as exc:
+        print(f"[rag/sources] failed: {exc}")
+        raise HTTPException(status_code=502, detail="Could not list sources") from exc
+
+
+class RagDeleteRequest(BaseModel):
+    source: str
+
+
+@app.delete("/rag/sources")
+def rag_delete_source(req: RagDeleteRequest):
+    """Remove all chunks of one document from the Knowledge Base."""
+    source = (req.source or "").strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="source is required")
+    try:
+        delete_by_metadata({"source": source})
+        return {"deleted": source}
+    except Exception as exc:
+        print(f"[rag/sources delete] failed: {exc}")
+        raise HTTPException(status_code=502, detail="Could not delete source") from exc
 
 
 @app.post("/extract")
