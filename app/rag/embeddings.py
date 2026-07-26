@@ -1,8 +1,12 @@
 """
-Gemini embeddings client (text-embedding-004, 768-dim) over raw REST.
+Gemini embeddings client (gemini-embedding-001, 768-dim) over raw REST.
 
 Used to embed enriched child chunks at ingestion time and queries at
 retrieval time. Uses the batch endpoint to embed many chunks in one call.
+
+Note: the legacy `text-embedding-004` model was retired by Google (its
+endpoint now 404s), so we use `gemini-embedding-001` and request a 768-dim
+output (`outputDimensionality`) to keep the vector size stable.
 """
 
 from __future__ import annotations
@@ -13,8 +17,8 @@ from typing import List
 import requests
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "text-embedding-004")
-EMBED_DIM = 768  # text-embedding-004 output dimensionality
+EMBED_MODEL = os.getenv("GEMINI_EMBED_MODEL", "gemini-embedding-001")
+EMBED_DIM = 768  # requested output dimensionality (gemini-embedding-001 supports 768/1536/3072)
 _BATCH = 100
 
 
@@ -41,6 +45,7 @@ def embed_texts(texts: List[str], task_type: str = "RETRIEVAL_DOCUMENT") -> List
                     "model": model_path,
                     "content": {"parts": [{"text": t}]},
                     "taskType": task_type,
+                    "outputDimensionality": EMBED_DIM,
                 }
                 for t in batch
             ]
