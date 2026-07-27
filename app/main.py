@@ -38,7 +38,7 @@ from app.llm.correction_graph import (
     run_module_classification,
 )
 from app.rag.ingest import ingest_text, retrieve
-from app.rag.jobs import create_job, get_job, update_job
+from app.rag.jobs import create_job, get_job, list_jobs, update_job
 from app.rag.vector_store import delete_by_metadata, list_sources
 
 
@@ -210,6 +210,31 @@ def _run_ingest(job_id: str, text: str, metadata: dict) -> None:
         update_job(job_id, status="failed", error=_friendly_ingest_error(exc))
 
 
+def _run_ingest_file(job_id: str, file_bytes: bytes, ext: str, metadata: dict) -> None:
+    """Background worker for uploads: extract text FIRST (large PDFs can be slow,
+    so it must not block the HTTP request), then chunk → enrich → embed → store."""
+    update_job(job_id, status="processing")
+    try:
+        if ext == "docx":
+            document_text, _ = extract_docx(file_bytes)
+        else:  # pdf (already validated at the endpoint)
+            document_text, _ = extract_pdf(file_bytes)
+        if not document_text.strip():
+            update_job(job_id, status="failed", error="Aucun texte extractible du document.")
+            return
+        result = ingest_text(document_text, metadata)
+        update_job(
+            job_id,
+            status="done",
+            chunks=result["chunks"],
+            parents=result["parents"],
+        )
+        print(f"[rag/ingest] job {job_id} done: {result}")
+    except Exception as exc:
+        print(f"[rag/ingest] job {job_id} failed: {exc}")
+        update_job(job_id, status="failed", error=_friendly_ingest_error(exc))
+
+
 def _friendly_ingest_error(exc: Exception) -> str:
     """Turn low-level network/DNS errors into an admin-readable message."""
     raw = str(exc)
@@ -241,29 +266,23 @@ async def rag_ingest(
     the chunk/enrich/embed/store work runs in the background so the admin UI
     never blocks. Poll GET /rag/status/{job_id}.
     """
-    document_text = ""
     resolved_source = source
+    file_bytes: bytes | None = None
+    ext = ""
 
     if file is not None and file.filename:
+        # Read the bytes here, but defer extraction to the background worker so a
+        # large (100-200MB) document never blocks the request or times it out.
         file_bytes = await file.read()
         file_name = file.filename
         ext = file_name.rsplit(".", 1)[-1].lower() if "." in file_name else ""
-        if ext == "docx":
-            document_text, _ = extract_docx(file_bytes)
-        elif ext == "pdf":
-            document_text, _ = extract_pdf(file_bytes)
-        else:
+        if ext not in ("pdf", "docx"):
             raise HTTPException(
                 status_code=400, detail=f"Unsupported file type: .{ext}"
             )
         resolved_source = source or file_name
-    elif text.strip():
-        document_text = text
-    else:
+    elif not text.strip():
         raise HTTPException(status_code=400, detail="Provide a file or text")
-
-    if not document_text.strip():
-        raise HTTPException(status_code=400, detail="Document has no extractable text")
 
     metadata = {
         "year": year,
@@ -275,7 +294,10 @@ async def rag_ingest(
     metadata = {k: v for k, v in metadata.items() if v}
 
     job_id = create_job(metadata)
-    background.add_task(_run_ingest, job_id, document_text, metadata)
+    if file_bytes is not None:
+        background.add_task(_run_ingest_file, job_id, file_bytes, ext, metadata)
+    else:
+        background.add_task(_run_ingest, job_id, text, metadata)
     return {"jobId": job_id, "status": "queued", "metadata": metadata}
 
 
@@ -285,6 +307,13 @@ def rag_status(job_id: str):
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
     return job
+
+
+@app.get("/rag/jobs")
+def rag_jobs():
+    """List all ingestion jobs (newest first) so the UI can always show pending
+    work — even after the admin navigates away and back."""
+    return {"jobs": list_jobs()}
 
 
 class RagSearchRequest(BaseModel):

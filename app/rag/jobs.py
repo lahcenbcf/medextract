@@ -14,10 +14,11 @@ from __future__ import annotations
 import threading
 import time
 import uuid
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 _lock = threading.Lock()
 _jobs: Dict[str, Dict[str, Any]] = {}
+_MAX_JOBS = 200  # cap the in-memory registry; evict oldest terminal jobs beyond this
 
 
 def create_job(metadata: Dict[str, Any]) -> str:
@@ -33,7 +34,27 @@ def create_job(metadata: Dict[str, Any]) -> str:
             "createdAt": time.time(),
             "updatedAt": time.time(),
         }
+        # Bound memory: drop the oldest finished jobs once we exceed the cap.
+        if len(_jobs) > _MAX_JOBS:
+            terminal = sorted(
+                (j for j in _jobs.values() if j["status"] in ("done", "failed")),
+                key=lambda j: j["createdAt"],
+            )
+            for j in terminal:
+                if len(_jobs) <= _MAX_JOBS:
+                    break
+                _jobs.pop(j["id"], None)
     return job_id
+
+
+def list_jobs() -> List[Dict[str, Any]]:
+    """All jobs, newest first — lets the UI show pending work across reloads."""
+    with _lock:
+        return sorted(
+            (dict(j) for j in _jobs.values()),
+            key=lambda j: j["createdAt"],
+            reverse=True,
+        )
 
 
 def update_job(job_id: str, **fields: Any) -> None:

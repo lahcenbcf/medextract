@@ -26,7 +26,14 @@ import time
 from typing import Any, Dict, List, Optional, TypedDict
 
 import requests
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    model_validator,
+)
 from langgraph.graph import StateGraph, END
 
 from app.rag.ingest import retrieve
@@ -40,9 +47,30 @@ RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
 class CorrectionChoice(BaseModel):
     # Lenient: in web-search mode (no enforced schema) the model often omits
     # the label and embeds it in the text — we normalise it after parsing.
-    label: str = ""
-    text: str
+    # Tolerate model drift: some models emit `letter` instead of `label`.
+    model_config = ConfigDict(populate_by_name=True)
+    label: str = Field("", validation_alias=AliasChoices("label", "letter"))
+    text: str = ""
     isCorrect: bool = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data):
+        """Tolerate model drift: None → "" for strings, and the common case where
+        the model puts the WHOLE option in `label`/`letter` with no `text`."""
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        for k in ("label", "letter", "text"):
+            if d.get(k) is None:
+                d[k] = ""
+        if not (d.get("text") or "").strip():
+            alt = (d.get("label") or d.get("letter") or "").strip()
+            if alt:
+                d["text"] = alt  # _normalize_labels will re-extract the letter
+                d["label"] = ""
+                d.pop("letter", None)
+        return d
 
 
 class CorrectionQuestion(BaseModel):
@@ -62,6 +90,30 @@ class CorrectionQuestion(BaseModel):
     # Résidanat only: which of the 3 fixed épreuves this question belongs to —
     # "biologie" | "chirurgie" | "medecine". Empty for non-résidanat exams.
     epreuve: str = ""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce(cls, data):
+        """Tolerate model drift so a single odd field never drops the question:
+        None → "" for string fields, and `correctAnswers` as a list → "A,B"."""
+        if not isinstance(data, dict):
+            return data
+        d = dict(data)
+        for k in (
+            "description",
+            "explanation",
+            "caseDescription",
+            "epreuve",
+            "correctAnswers",
+        ):
+            if d.get(k) is None:
+                d[k] = ""
+        ca = d.get("correctAnswers")
+        if isinstance(ca, list):
+            d["correctAnswers"] = ",".join(
+                str(x).strip() for x in ca if str(x).strip()
+            )
+        return d
 
 
 # Gemini responseSchema (OpenAPI 3.0 subset) for ONE question object.
@@ -466,20 +518,27 @@ _LABEL_PREFIX = re.compile(r"^\s*([A-Za-z]|\d{1,2})\s*[.)\-–:]\s*")
 
 
 def _normalize_labels(choices: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Ensure every choice has a label. If missing, pull it from the text
-    prefix ("A. foo" → label A, text foo); otherwise assign A, B, C… by order."""
+    """Ensure every choice has an authoritative label + clean text.
+
+    Tolerates model drift: honours an explicit `label` OR `letter` field, and
+    ALWAYS strips a redundant leading label prefix from the text ("A. foo" → foo),
+    so the label is never both a field AND embedded in the text. Falls back to the
+    text prefix, then to A, B, C… by order."""
     for i, c in enumerate(choices):
-        label = (c.get("label") or "").strip()
+        # The model sometimes calls it `letter` instead of `label`.
+        label = (c.get("label") or c.get("letter") or "").strip()
         text = (c.get("text") or "").strip()
+        m = _LABEL_PREFIX.match(text)
+        if m:
+            # Always remove the "A." / "A)" prefix from the visible text.
+            text = text[m.end():].strip()
+            if not label:
+                label = m.group(1)
         if not label:
-            m = _LABEL_PREFIX.match(text)
-            if m:
-                label = m.group(1).upper()
-                text = text[m.end():].strip()
-            else:
-                label = chr(65 + i)  # A, B, C, …
-        c["label"] = label
+            label = chr(65 + i)  # A, B, C, …
+        c["label"] = label.upper()
         c["text"] = text
+        c.pop("letter", None)
     return choices
 
 
@@ -508,22 +567,54 @@ def _parse_questions(raw: str) -> List[Dict[str, Any]]:
     return out
 
 
+def _match_bracket(t: str, start: int) -> int:
+    """Index of the bracket that closes the one at `start`, string-aware.
+    Ignores brackets inside JSON strings and any trailing text after the match
+    (e.g. a "SOURCES WEB" block the model appends after the array)."""
+    open_ch = t[start]
+    close_ch = "]" if open_ch == "[" else "}"
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(t)):
+        ch = t[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif ch == "\\":
+                esc = True
+            elif ch == '"':
+                in_str = False
+        elif ch == '"':
+            in_str = True
+        elif ch == open_ch:
+            depth += 1
+        elif ch == close_ch:
+            depth -= 1
+            if depth == 0:
+                return i
+    return -1
+
+
 def _extract_json(text: str):
-    """Best-effort: pull the outermost JSON array/object from model text."""
+    """Pull the FIRST complete JSON array/object from model text, ignoring any
+    trailing prose (grounding "SOURCES WEB" blocks, notes) that the model appends
+    after it — matching brackets by depth so trailing brackets never corrupt it."""
     t = (text or "").strip()
     if t.startswith("```"):
         # drop the opening fence (+ optional language tag) and closing fence
         t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
         t = re.sub(r"\s*```$", "", t).strip()
-    start = t.find("[")
-    end = t.rfind("]")
-    if start != -1 and end > start:
-        return json.loads(t[start : end + 1])
-    # fall back to a single object
-    start, end = t.find("{"), t.rfind("}")
-    if start != -1 and end > start:
-        return json.loads(t[start : end + 1])
-    raise ValueError("no JSON found")
+    # Prefer an array; else a single object — whichever opens first.
+    arr, obj = t.find("["), t.find("{")
+    candidates = [p for p in (arr, obj) if p != -1]
+    if not candidates:
+        raise ValueError("no JSON found")
+    start = min(candidates)
+    end = _match_bracket(t, start)
+    if end == -1:
+        raise ValueError("no balanced JSON found")
+    return json.loads(t[start : end + 1])
 
 
 def _classify(state: CorrectionState) -> CorrectionState:
