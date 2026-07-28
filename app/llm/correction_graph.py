@@ -190,6 +190,7 @@ class CorrectionState(TypedDict, total=False):
     candidate_courses: List[Dict[str, Any]]  # [{id, name, group?}]
     allow_new_course: bool  # False for residanat (existing courses only)
     context: str
+    kb_sources: List[Dict[str, Any]]  # retrieved KB docs [{source, course, snippet}]
     questions: List[Dict[str, Any]]  # structured output (+ suggestions after classify)
     reply: str  # web-search markdown (structured mode leaves this empty)
     # Clinical-case memory (partial submissions)
@@ -312,12 +313,18 @@ def _retrieve_context(state: CorrectionState) -> CorrectionState:
         return {"context": ""}
 
     blocks = []
+    kb_sources: List[Dict[str, Any]] = []
     for i, hit in enumerate(hits, start=1):
         source = hit.get("source") or "unknown"
         course = hit.get("course") or ""
+        ctx = hit.get("context", "") or ""
         header = f"[{i}] source: {source}" + (f" | course: {course}" if course else "")
-        blocks.append(f"{header}\n{hit.get('context', '')}")
-    return {"context": "\n\n---\n\n".join(blocks)}
+        blocks.append(f"{header}\n{ctx}")
+        # Keep the top chunk of each doc so the UI can show it on hover.
+        kb_sources.append(
+            {"source": source, "course": course, "snippet": ctx.strip()[:400]}
+        )
+    return {"context": "\n\n---\n\n".join(blocks), "kb_sources": kb_sources}
 
 
 # ─── Clinical-case detection + memory (partial submissions) ────────────
@@ -499,6 +506,8 @@ def _generate(state: CorrectionState) -> CorrectionState:
         return {"questions": [], "reply": research or "No response generated"}
 
     # No web search: enforce the JSON array with responseSchema (most reliable).
+    # The mode-specific source rule (KB document / established knowledge) is
+    # appended to the system prompt by z_api/NoblesQcm per the active mode.
     system_prompt += (
         "\n\nL'administrateur peut coller UNE ou PLUSIEURS questions à la fois. "
         "Renvoie un TABLEAU JSON avec un objet par question, dans l'ordre."
@@ -759,6 +768,9 @@ def run_correction(
     if clinical_case:
         out["caseContext"] = result.get("case_context", case_context)
         out["isNewCase"] = bool(result.get("is_new_case"))
+    kb_sources = result.get("kb_sources") or []
+    if kb_sources:
+        out["kbSources"] = kb_sources
     return out
 
 
