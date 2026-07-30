@@ -52,6 +52,8 @@ class CorrectionChoice(BaseModel):
     label: str = Field("", validation_alias=AliasChoices("label", "letter"))
     text: str = ""
     isCorrect: bool = False
+    # Amboss-style per-choice commentary (why this option is true/false, + source).
+    explanation: str = ""
 
     @model_validator(mode="before")
     @classmethod
@@ -61,7 +63,7 @@ class CorrectionChoice(BaseModel):
         if not isinstance(data, dict):
             return data
         d = dict(data)
-        for k in ("label", "letter", "text"):
+        for k in ("label", "letter", "text", "explanation"):
             if d.get(k) is None:
                 d[k] = ""
         if not (d.get("text") or "").strip():
@@ -130,8 +132,9 @@ QUESTION_RESPONSE_SCHEMA: Dict[str, Any] = {
                     "label": {"type": "STRING"},
                     "text": {"type": "STRING"},
                     "isCorrect": {"type": "BOOLEAN"},
+                    "explanation": {"type": "STRING"},
                 },
-                "required": ["label", "text", "isCorrect"],
+                "required": ["label", "text", "isCorrect", "explanation"],
             },
         },
         "propositions": {
@@ -143,12 +146,13 @@ QUESTION_RESPONSE_SCHEMA: Dict[str, Any] = {
                     "label": {"type": "STRING"},
                     "text": {"type": "STRING"},
                     "isCorrect": {"type": "BOOLEAN"},
+                    "explanation": {"type": "STRING"},
                 },
-                "required": ["label", "text", "isCorrect"],
+                "required": ["label", "text", "isCorrect", "explanation"],
             },
         },
         "correctAnswers": {"type": "STRING"},
-        # One consolidated commentary for the whole question.
+        # Optional short general summary — the primary commentary is now per-choice.
         "explanation": {"type": "STRING"},
         "caseDescription": {"type": "STRING"},
         "caseIndex": {"type": "INTEGER", "nullable": True},
