@@ -473,14 +473,17 @@ def _generate(state: CorrectionState) -> CorrectionState:
             )
 
         struct_system = system_prompt + (
-            "\n\nStructure l'analyse fournie en objets question JSON. Le champ "
-            "« explanation » est UN SEUL commentaire consolidé pour toute la question : "
-            "traite CHAQUE option (« A. … B. … », pourquoi vraie/fausse) — ou, pour une "
-            "question à choix composés (K-type), traite chaque réponse composée "
-            "(« A. (1+2) vraie car… ») et NON les sous-propositions individuelles. "
-            "Termine par « Source : <URL> » avec une URL RÉELLE de la liste SOURCES WEB "
-            "ci-dessus (jamais inventée) ; si la liste est vide, écris "
-            "« Source : connaissances médicales établies »."
+            "\n\nStructure l'analyse fournie en objets question JSON. CHAQUE option "
+            "porte SA PROPRE explication dans SON champ « explanation » : pourquoi "
+            "CETTE option est vraie ou fausse. Ne produis PAS de commentaire global — "
+            "le champ « explanation » au niveau de la question reste VIDE (\"\"). "
+            "Pour une question à choix composés (K-type), les options lettrées SONT "
+            "les réponses composées : explique chaque option lettrée "
+            "(« A. (1+2) vraie car… ») en justifiant les sous-propositions qu'elle "
+            "contient, et NON les sous-propositions comme entrées séparées. "
+            "Termine CHAQUE explication par « Source : <URL> » avec une URL RÉELLE de "
+            "la liste SOURCES WEB ci-dessus (jamais inventée) ; si la liste est vide, "
+            "n'ajoute aucune mention de source."
         )
         struct_contents = [
             {
