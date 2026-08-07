@@ -390,6 +390,250 @@ def _build_prompt(chunk: dict, file_name: str, dynamic_context: str = "") -> str
     return f"{file_context}Extrais toutes les questions QCM du document suivant:\n\n{chunk['text']}"
 
 
+# ─── Gemini extraction (REST, no SDK pin — same approach as correction_graph) ──
+
+GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
+
+_GEMINI_CHOICE_SCHEMA = {
+    "type": "OBJECT",
+    "properties": {
+        "label": {"type": "STRING"},
+        "text": {"type": "STRING"},
+        "is_correct": {"type": "BOOLEAN"},
+    },
+    "required": ["label", "text", "is_correct"],
+}
+
+# Mirrors LLMExtractionOutput so the JSON validates straight into Pydantic.
+GEMINI_EXTRACTION_SCHEMA: dict = {
+    "type": "OBJECT",
+    "properties": {
+        "questions": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "type": {
+                        "type": "STRING",
+                        "enum": ["UNIQUE_CHOICE", "CLINIC_CASE", "QROC"],
+                    },
+                    "description": {"type": "STRING"},
+                    "choices": {"type": "ARRAY", "items": _GEMINI_CHOICE_SCHEMA},
+                    "propositions": {
+                        "type": "ARRAY",
+                        "items": _GEMINI_CHOICE_SCHEMA,
+                    },
+                    "is_ktype": {"type": "BOOLEAN"},
+                    "correct_answers": {"type": "STRING"},
+                    "explanation": {"type": "STRING"},
+                    "logic_type": {
+                        "type": "STRING",
+                        "enum": ["POSITIVE", "NEGATIVE"],
+                    },
+                    "course_name": {"type": "STRING"},
+                    "context": {"type": "STRING"},
+                    "is_clinical_case_child": {"type": "BOOLEAN"},
+                    "clinical_case_id": {"type": "INTEGER", "nullable": True},
+                    "where_is_mentioned": {
+                        "type": "ARRAY",
+                        "items": {"type": "STRING"},
+                    },
+                    "indication": {"type": "ARRAY", "items": {"type": "STRING"}},
+                },
+                "required": [
+                    "type",
+                    "description",
+                    "choices",
+                    "correct_answers",
+                    "logic_type",
+                ],
+            },
+        },
+        "clinical_cases": {
+            "type": "ARRAY",
+            "items": {
+                "type": "OBJECT",
+                "properties": {
+                    "name": {"type": "STRING"},
+                    "intro_text": {"type": "STRING"},
+                },
+                "required": ["name", "intro_text"],
+            },
+        },
+    },
+    "required": ["questions"],
+}
+
+
+def _remap_clinical_cases(
+    result: LLMExtractionOutput,
+    chunk: dict,
+    dynamic_context: str,
+    all_cases: list,
+) -> str:
+    """
+    Map each question's chunk-local `clinical_case_id` onto a document-global
+    case index, so a case split across chunks stays one case.
+
+    Returns the (possibly reset) dynamic_context for the next chunk.
+    """
+    if not chunk['is_continuation']:
+        dynamic_context = ""
+    active_ctx = chunk['context'] if chunk['context'] else dynamic_context
+
+    def normalize(text):
+        n = str(text).lower()
+        n = re.sub(r'n[°0o]', '', n)
+        return re.sub(r'[^a-z0-9]', '', n)
+
+    for q in result.questions:
+        if not q.is_clinical_case_child:
+            continue
+        if q.clinical_case_id is not None and 0 <= q.clinical_case_id < len(result.clinical_cases):
+            case_obj = result.clinical_cases[q.clinical_case_id]
+            matched_global_idx = -1
+            t2 = normalize(case_obj.intro_text)
+
+            # 0. Continuation of the currently active context
+            if active_ctx and len(t2) > 15:
+                norm_active = normalize(active_ctx)
+                if t2[:30] in norm_active or norm_active[:30] in t2:
+                    if all_cases:
+                        matched_global_idx = len(all_cases) - 1
+
+            # 1. Text similarity against already-seen cases
+            if matched_global_idx == -1 and len(t2) > 15:
+                for idx, gc in enumerate(all_cases):
+                    t1 = normalize(gc.intro_text)
+                    if len(t1) > 15 and (t2[:30] in t1 or t1[:30] in t2):
+                        matched_global_idx = idx
+                        break
+
+            # 2. Normalized name (generic "cas clinique N" names don't count)
+            if matched_global_idx == -1:
+                norm_name = normalize(case_obj.name)
+                if norm_name and not re.match(r'^casclinique\d*$', norm_name):
+                    for idx, gc in enumerate(all_cases):
+                        if normalize(gc.name) == norm_name:
+                            matched_global_idx = idx
+                            break
+
+            if matched_global_idx == -1:
+                matched_global_idx = len(all_cases)
+                all_cases.append(case_obj)
+
+            q.clinical_case_id = matched_global_idx
+        else:
+            # No local case object → fall back to the last active one.
+            if all_cases and active_ctx:
+                q.clinical_case_id = len(all_cases) - 1
+            else:
+                q.clinical_case_id = None
+                q.is_clinical_case_child = False
+
+    return dynamic_context
+
+
+def extract_with_gemini(
+    markdown_text: str,
+    file_name: str,
+    model: str = "gemini-2.0-flash",
+) -> LLMExtractionOutput:
+    """
+    Extract QCM questions with Gemini, over raw REST — the same approach the
+    correction graph already uses, so no SDK version is pinned.
+
+    Gemini is used strictly as an EXTRACTOR here: the system prompt forbids it
+    from reasoning about answers, and `responseSchema` forces the exact JSON
+    shape, so there is no reasoning-token budget to exhaust.
+    """
+    import requests
+
+    api_key = os.getenv("GEMINI_API_KEY", "")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+
+    chunks = chunk_document(markdown_text)
+    all_questions: list[LLMQuestionOutput] = []
+    all_cases: list[LLMClinicalCase] = []
+    dynamic_context = ""
+
+    for chunk in chunks:
+        prompt = _build_prompt(chunk, file_name, dynamic_context)
+        print(
+            f"[LLM] Processing chunk {chunk['chunk_index']+1}/{len(chunks)} "
+            f"({len(chunk['text'])} chars)..."
+        )
+
+        body = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json",
+                "responseSchema": GEMINI_EXTRACTION_SCHEMA,
+                # Generous ceiling: a dense chunk with per-choice explanations
+                # produces a lot of JSON, and truncation loses the whole chunk.
+                "maxOutputTokens": 32768,
+            },
+        }
+
+        result: Optional[LLMExtractionOutput] = None
+        for attempt in range(4):
+            try:
+                resp = requests.post(
+                    f"{GEMINI_ENDPOINT}/{model}:generateContent?key={api_key}",
+                    json=body,
+                    timeout=180,
+                )
+                if resp.status_code >= 400:
+                    raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:300]}")
+                data = resp.json()
+                parts = (
+                    data.get("candidates", [{}])[0]
+                    .get("content", {})
+                    .get("parts", [])
+                )
+                raw = "".join(p.get("text", "") for p in parts)
+                if not raw.strip():
+                    raise RuntimeError("Empty response from Gemini")
+                result = LLMExtractionOutput.model_validate(json.loads(raw))
+                break
+            except Exception as e:
+                wait = 2 ** (attempt + 1)
+                print(f"[LLM] Error on chunk {chunk['chunk_index']+1}: {e}")
+                if attempt == 3:
+                    # One bad chunk must not sink the whole document.
+                    print(
+                        f"[LLM] Chunk {chunk['chunk_index']+1} skipped after 4 attempts"
+                    )
+                    break
+                print(f"[LLM] retrying in {wait}s...")
+                time.sleep(wait)
+
+        if result is None:
+            continue
+
+        dynamic_context = _remap_clinical_cases(
+            result, chunk, dynamic_context, all_cases
+        )
+        all_questions.extend(result.questions)
+        print(
+            f"[LLM] Chunk {chunk['chunk_index']+1}: {len(result.questions)} questions, "
+            f"{len(result.clinical_cases)} cases"
+        )
+
+        if result.questions:
+            last_q = result.questions[-1]
+            dynamic_context = last_q.context or ""
+
+    print(
+        f"[LLM] Gemini extraction done: {len(all_questions)} questions, "
+        f"{len(all_cases)} clinical case(s)"
+    )
+    return LLMExtractionOutput(questions=all_questions, clinical_cases=all_cases)
+
+
 def extract_with_openai(
     markdown_text: str,
     api_keys: list[str],
@@ -739,7 +983,10 @@ def extract_questions(
     """
     print(f"[LLM] Starting extraction (provider={provider}, doc_size={len(markdown_text)} chars)")
 
-    if provider == "openai":
+    if provider == "gemini":
+        model = os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        return extract_with_gemini(markdown_text, file_name, model=model)
+    elif provider == "openai":
         keys = api_keys or [os.getenv("OPENAI_API_KEY", "")]
         model = os.getenv("OPENAI_MODEL", "gpt-4o")
         return extract_with_openai(markdown_text, keys, file_name, model=model)

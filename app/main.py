@@ -483,6 +483,10 @@ def extract_document(
                 raise HTTPException(status_code=500, detail="No GROQ_API_KEY found")
         if llm_provider == "groq":
             llm_api_keys = groq_keys
+        elif llm_provider == "gemini":
+            # extract_with_gemini reads GEMINI_API_KEY itself; keep the guard
+            # below meaningful by surfacing the same key here.
+            llm_api_keys = [os.getenv("GEMINI_API_KEY")]
         else:
             llm_api_keys = [os.getenv("OPENAI_API_KEY")] if llm_provider == "openai" else [os.getenv("ANTHROPIC_API_KEY")]
 
