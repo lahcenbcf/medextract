@@ -164,6 +164,41 @@ def classify(req: ClassifyRequest):
         raise HTTPException(status_code=502, detail="Classification failed") from exc
 
 
+class TranslateRequest(BaseModel):
+    # The stored question: { description, caseDescription?, explanation?,
+    # choices[], propositions[] } — labels are echoed back untouched.
+    question: dict
+    language: str = "en"
+    model: str | None = None
+    # FR→EN pairs, ALREADY filtered by z_api to those present in this question.
+    glossary: list[dict] = []
+
+
+@app.post("/translate")
+def translate(req: TranslateRequest):
+    """
+    Produce the English version of one question.
+
+    Not a literal translation: the prompt asks for medical English as written
+    for medical students, while labels, K-type combinations and HTML markup are
+    preserved verbatim.
+    """
+    if not req.question:
+        raise HTTPException(status_code=400, detail="question is required")
+    try:
+        from app.llm.translation import translate_question
+
+        return translate_question(
+            req.question,
+            language=req.language,
+            model=req.model,
+            glossary=req.glossary,
+        )
+    except Exception as exc:
+        print(f"[translate] failed: {exc}")
+        raise HTTPException(status_code=502, detail="Translation failed") from exc
+
+
 class ClassifyModuleRequest(BaseModel):
     # Already-structured questions — [{description, caseDescription?}]
     questions: list[dict] = []
