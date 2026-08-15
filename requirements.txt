@@ -9,3 +9,5 @@ requests>=2.31.0
 python-multipart>=0.0.9
 langgraph>=0.2.0
 qdrant-client>=1.9.0
+# OCR 4 for scanned books (second ingestion path)
+mistralai>=2.9.0

@@ -33,6 +33,11 @@ def extract_pdf(file_bytes: bytes) -> tuple[str, dict[str, io.BytesIO]]:
     for page_num in range(len(doc)):
         page = doc[page_num]
 
+        # Location marker consumed by the RAG chunker (app/rag/chunking.py) and
+        # stripped before indexing. Without it the page number is lost here for
+        # good, and a grounded answer can only cite a page it invented.
+        lines.append(f"<!--loc:page={page_num + 1}-->")
+
         # ─── Extract images from the page ────────────────────────────
         image_list = page.get_images(full=True)
         for img_info in image_list:

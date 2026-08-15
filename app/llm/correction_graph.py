@@ -40,7 +40,11 @@ from app.rag.ingest import retrieve
 
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "5"))
+# Three, not five: the two tail hits were consistently off-topic on the corpus
+# we measured. Fewer blocks means less noise in the model's context — but the
+# dense ranking only separates first from fifth by 0.04, so this is a bet on the
+# ranking being right. The cross-encoder reranker is what makes it a safe one.
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
 
 
 # ─── Pydantic models (structured-output validation) ────────────────────
@@ -54,6 +58,8 @@ class CorrectionChoice(BaseModel):
     isCorrect: bool = False
     # Amboss-style per-choice commentary (why this option is true/false, + source).
     explanation: str = ""
+    source: str | None = None
+    sourceRef: dict | None = None
 
     @model_validator(mode="before")
     @classmethod
@@ -63,9 +69,9 @@ class CorrectionChoice(BaseModel):
         if not isinstance(data, dict):
             return data
         d = dict(data)
-        for k in ("label", "letter", "text", "explanation"):
+        for k in ("label", "letter", "text", "explanation", "source", "sourceRef"):
             if d.get(k) is None:
-                d[k] = ""
+                d[k] = "" if k not in ("source", "sourceRef") else None
         if not (d.get("text") or "").strip():
             alt = (d.get("label") or d.get("letter") or "").strip()
             if alt:
@@ -81,9 +87,12 @@ class CorrectionQuestion(BaseModel):
     choices: List[CorrectionChoice] = Field(default_factory=list)
     propositions: List[CorrectionChoice] | None = None
     correctAnswers: str = ""
-    # ONE consolidated commentary for the whole question (why each option /
-    # composed K-type answer is correct/false, with sources).
+    # Reviewer-facing ALERTS only ("⚠️ CONFLIT CLÉ", "⚠️ AMBIGUË"…) — the
+    # per-option commentary lives on each choice, the student-facing recap in
+    # `globalComment`.
     explanation: str = ""
+    # Student-facing recap of the whole question (HTML table allowed).
+    globalComment: str = ""
     # Clinical case: the shared/preceding context for THIS question (patient
     # intro, new lab results…) — empty for a standalone question — and the
     # question's index within the case.
@@ -104,6 +113,7 @@ class CorrectionQuestion(BaseModel):
         for k in (
             "description",
             "explanation",
+            "globalComment",
             "caseDescription",
             "epreuve",
             "correctAnswers",
@@ -147,13 +157,16 @@ QUESTION_RESPONSE_SCHEMA: Dict[str, Any] = {
                     "text": {"type": "STRING"},
                     "isCorrect": {"type": "BOOLEAN"},
                     "explanation": {"type": "STRING"},
+                    "source": {"type": "STRING", "nullable": True},
                 },
                 "required": ["label", "text", "isCorrect", "explanation"],
             },
         },
         "correctAnswers": {"type": "STRING"},
-        # Optional short general summary — the primary commentary is now per-choice.
+        # Reviewer alerts only; the per-option commentary is on each choice.
         "explanation": {"type": "STRING"},
+        # Student-facing recap of the question (HTML table allowed).
+        "globalComment": {"type": "STRING"},
         "caseDescription": {"type": "STRING"},
         "caseIndex": {"type": "INTEGER", "nullable": True},
         # Résidanat only: "biologie" | "chirurgie" | "medecine" (empty otherwise).
@@ -243,6 +256,7 @@ def _gemini_generate(
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not configured")
+    print(f"\n[DEBUG MODEL] {model}")   
     model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     body: Dict[str, Any] = {
@@ -301,14 +315,42 @@ def _gemini_grounded(
     return text, sources
 
 
+def _rewrite_for_retrieval(message: str, model: Optional[str] = None) -> str:
+    """Extract medical keywords from a vignette to improve dense retrieval."""
+    prompt = (
+        "Extrais 3 à 6 mots-clés ou concepts médicaux précis de ce texte pour "
+        "une recherche dans un manuel de médecine (ex: syndromes, signes pathognomoniques, "
+        "traitements). Élimine les mots génériques (patient, ans, présente, clinique). "
+        "Réponds UNIQUEMENT par les mots-clés séparés par des virgules.\n\n"
+        f"{message[:1000]}"
+    )
+    try:
+        out = _gemini_generate("", [{"role": "user", "parts": [{"text": prompt}]}], model=model)
+        return out.strip() if len(out) < 150 else message
+    except Exception as exc:
+        print(f"[correction_graph] rewrite failed, using raw message: {exc}")
+        return message
+
 def _retrieve_context(state: CorrectionState) -> CorrectionState:
     """RAG node: metadata-filtered grounding from the Local Knowledge Base."""
+    search_query = state["message"]
+    # Enhance retrieval if the query is a long clinical vignette (over 100 chars)
+    if len(search_query) > 100:
+        rewritten = _rewrite_for_retrieval(search_query, state.get("model"))
+        if rewritten and rewritten != search_query:
+            print(f"\n[DEBUG RAG] Rewrote query to: {rewritten}")
+            # Combine keywords with the original to preserve both specific terms and context
+            search_query = f"{rewritten} {search_query[:200]}"
+            
+    print(f"\n[DEBUG RAG] Retrieving for query: {search_query[:100]}...")
+    print(f"[DEBUG RAG] With metadata filter: {state.get('metadata')}")
     try:
         hits = retrieve(
-            query=state["message"],
+            query=search_query,
             metadata=state.get("metadata") or {},
             top_k=RAG_TOP_K,
         )
+        print(f"[DEBUG RAG] Found {len(hits)} hits.")
     except Exception as exc:  # noqa: BLE001 - never fail the chat on KB issues
         print(f"[correction_graph] KB retrieval failed, continuing without: {exc}")
         return {"context": ""}
@@ -322,11 +364,32 @@ def _retrieve_context(state: CorrectionState) -> CorrectionState:
         source = hit.get("source") or "unknown"
         course = hit.get("course") or ""
         ctx = hit.get("context", "") or ""
-        header = f"[{i}] source: {source}" + (f" | course: {course}" if course else "")
+        page = hit.get("page")
+        section = hit.get("section") or ""
+        # The localisation goes in the header so the model can cite it verbatim
+        # — it is the only page/section it will evercr_cache.load(sha256) legitimately know.
+        header = f"[{i}] source: {source}"
+        if page is not None:
+            header += f" | page: {page}"
+        if section:
+            header += f" | section: {section}"
+        if course:
+            header += f" | course: {course}"
         blocks.append(f"{header}\n{ctx}")
+        print(f"[DEBUG RAG] Hit {i}: {header} | Content snippet: {ctx[:100]}...")
         # Keep the top chunk of each doc so the UI can show it on hover.
         kb_sources.append(
-            {"source": source, "course": course, "snippet": ctx.strip()[:400]}
+            {
+                "source": source,
+                "course": course,
+                "page": page,
+                "section": section,
+                # The URL never enters the model's context — it would just be
+                # tokens. It travels to the UI only.
+                "fileUrl": hit.get("file_url") or "",
+                "snippet": ctx.strip()[:400],
+                "bbox": hit.get("bbox"),
+            }
         )
     return {"context": "\n\n---\n\n".join(blocks), "kb_sources": kb_sources}
 
@@ -428,16 +491,22 @@ def _generate(state: CorrectionState) -> CorrectionState:
     # Ground on retrieved course material when the KB node ran.
     system_prompt = state.get("system_prompt", "")
     context = state.get("context") or ""
+    print(f"\n[DEBUG GENERATE] context length: {len(context)} chars")
+    print(f"[DEBUG GENERATE] context preview: {context[:300]}..." if context else "[DEBUG GENERATE] NO CONTEXT (empty)")
     if context:
         system_prompt += (
-            "\n\n# LOCAL KNOWLEDGE BASE CONTEXT\n"
-            "The following excerpts come from the course material for this "
-            "exam's module and year. Prefer them over your own recollection "
-            "when they are relevant, and do not contradict them. If they do "
-            "not cover the question, rely on your medical knowledge and say so "
-            "in the explanation.\n\n"
+            "\n\nInstruction de source · Base de connaissances\n"
+            "# CITATION DE LA SOURCE — MODE BASE DE CONNAISSANCES\n"
+            "Des extraits de documents te sont fournis dans le contexte ci-dessous "
+            "(préfixés « source: <nom du document> »). Pour chaque option qui s'appuie "
+            "directement sur ces extraits, tu DOIS remplir le champ `source` avec : "
+            "<nom du document réel> (le document dont provient l'information), puis, "
+            "entre parenthèses, cite le PASSAGE le plus pertinent de cet extrait. "
+            "N'invente JAMAIS d'URL ni de document ; si aucun extrait ne couvre la "
+            "question, laisse le champ `source` VIDE ou NULL.\n\n"
             f"{context}"
         )
+        print(f"[DEBUG GENERATE] System prompt with KB context: {len(system_prompt)} chars total")
 
     # Clinical mode: prepend the remembered case context so a partial submission
     # (e.g. just "3. …") is corrected WITH the full patient background.
@@ -477,10 +546,24 @@ def _generate(state: CorrectionState) -> CorrectionState:
             "porte SA PROPRE explication dans SON champ « explanation » : pourquoi "
             "CETTE option est vraie ou fausse. Ne produis PAS de commentaire global — "
             "le champ « explanation » au niveau de la question reste VIDE (\"\"). "
-            "Pour une question à choix composés (K-type), les options lettrées SONT "
-            "les réponses composées : explique chaque option lettrée "
-            "(« A. (1+2) vraie car… ») en justifiant les sous-propositions qu'elle "
-            "contient, et NON les sous-propositions comme entrées séparées. "
+            "Pour une question à choix composés (K-type), l'explication se place sur "
+            "CHAQUE SOUS-PROPOSITION NUMÉROTÉE de « choices » (1, 2, 3…) : pourquoi CE "
+            "point précis est vrai ou faux. Les combinaisons lettrées de "
+            "« propositions » (« A. 1+2 ») ne portent AUCUNE explication — laisse leur "
+            "champ « explanation » VIDE (\"\"), elles ne font qu'assembler des "
+            "sous-propositions déjà justifiées. "
+            "Chaque explication fait 2 à 4 phrases et contient TOUJOURS l'élément "
+            "discriminant : le chiffre, le seuil, le critère ou le mécanisme qui permet "
+            "de trancher. Pas de paraphrase de l'option, pas de justification "
+            "circulaire. "
+            "Renseigne aussi « globalComment » : une SYNTHÈSE pédagogique destinée à "
+            "l'étudiant (affichée après sa réponse) — le raisonnement qui permet de "
+            "trancher, et si c'est pertinent un petit tableau comparatif en HTML "
+            "(<table>, <tr>, <td>). N'y recopie pas les explications option par option. "
+            "Laisse-le vide (\"\") si la question ne s'y prête pas. Le champ "
+            "« explanation » au niveau de la question reste réservé aux ALERTES "
+            "(« ⚠️ CONFLIT CLÉ : », « ⚠️ AMBIGUË : », « ⚠️ INCERTAIN : », « ⚠️ TEXTE : ») "
+            "et vaut \"\" s'il n'y a rien à signaler. "
             "Termine CHAQUE explication par « Source : <URL> » avec une URL RÉELLE de "
             "la liste SOURCES WEB ci-dessus (jamais inventée) ; si la liste est vide, "
             "n'ajoute aucune mention de source."
@@ -767,6 +850,64 @@ def run_correction(
         }
     )
     questions = result.get("questions") or []
+
+    # ── Programmatically populate the `source` + `sourceRef` on each choice ─
+    # The LLM rarely fills the JSON `source` field reliably, so we set it
+    # from the KB retrieval metadata we already have (document + pages).
+    # `sourceRef` carries the full hit (page, fileUrl, snippet) so the
+    # frontend can open the PDF at the exact page with passage highlighting.
+    kb_sources = result.get("kb_sources") or []
+    if questions and kb_sources:
+        # Build a concise source label: group pages per document.
+        from collections import OrderedDict
+        doc_pages: OrderedDict[str, list] = OrderedDict()
+        for ks in kb_sources:
+            doc = ks.get("source") or "unknown"
+            pg = ks.get("page")
+            doc_pages.setdefault(doc, [])
+            if pg is not None and pg not in doc_pages[doc]:
+                doc_pages[doc].append(pg)
+        source_labels = []
+        for doc, pages in doc_pages.items():
+            if pages:
+                pages_str = ", ".join(str(p) for p in sorted(pages))
+                source_labels.append(f"{doc} (pages {pages_str})")
+            else:
+                source_labels.append(doc)
+        source_label = " | ".join(source_labels)
+
+        # For each choice, find the KB hit whose snippet best overlaps
+        # with the choice's explanation text (simple word-overlap score).
+        def _best_hit(explanation: str) -> dict | None:
+            if not explanation or not kb_sources:
+                return None
+            exp_words = set(explanation.lower().split())
+            best, best_score = None, 0
+            for ks in kb_sources:
+                snip = (ks.get("snippet") or "").lower()
+                score = len(exp_words & set(snip.split()))
+                if score > best_score:
+                    best_score = score
+                    best = ks
+            return best if best_score > 2 else (kb_sources[0] if kb_sources else None)
+
+        for q in questions:
+            for choice in q.get("choices") or []:
+                if not choice.get("source"):
+                    choice["source"] = source_label
+                hit = _best_hit(choice.get("explanation") or "")
+                if hit:
+                    choice["sourceRef"] = {
+                        "source": hit.get("source") or "",
+                        "page": hit.get("page"),
+                        "fileUrl": hit.get("fileUrl") or "",
+                        "snippet": hit.get("snippet") or "",
+                        "bbox": hit.get("bbox"),
+                    }
+            for prop in q.get("propositions") or []:
+                if not prop.get("source"):
+                    prop["source"] = source_label
+
     out: Dict[str, Any] = (
         {"questions": questions}
         if questions
@@ -775,7 +916,6 @@ def run_correction(
     if clinical_case:
         out["caseContext"] = result.get("case_context", case_context)
         out["isNewCase"] = bool(result.get("is_new_case"))
-    kb_sources = result.get("kb_sources") or []
     if kb_sources:
         out["kbSources"] = kb_sources
     return out

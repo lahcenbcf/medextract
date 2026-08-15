@@ -40,6 +40,35 @@ def build_metadata_prefix(metadata: Dict[str, object]) -> str:
     return f"[{' | '.join(parts)}]" if parts else ""
 
 
+def build_context_prefix(child, metadata: Dict[str, object]) -> str:
+    """
+    The line that situates a chunk INSIDE its document.
+
+    The metadata prefix alone is identical on every chunk of a book, so it
+    separates documents — which the metadata filter already does — and tells
+    nothing apart within one. The section path does: measured on a real book,
+    32% of children were embedded with no trace of their section, so an excerpt
+    like "Le choc électrique externe (CEE)" carried nothing linking it to
+    "FIBRILLATION AURICULAIRE" and no question about AF could reach it.
+
+    The section path comes FIRST so it weighs most in the vector.
+    """
+    bits = []
+    path = " > ".join(p for p in (getattr(child, "section_path", None) or []) if p)
+    # The parent text already opens with the section path, so the FIRST window
+    # of a parent inherits it. Repeating it would double those tokens in the
+    # vector for no gain.
+    text = getattr(child, "text", "") or ""
+    if path and not text.lstrip().startswith(path[:40]):
+        bits.append(path)
+    label = getattr(child, "page_label", None)
+    if label:
+        bits.append(f"p. {label}")
+    head = " — ".join(bits)
+    meta = build_metadata_prefix(metadata)
+    return f"{head} {meta}".strip() if head else meta
+
+
 def _llm_context(child_text: str, parent_text: str) -> Optional[str]:
     """Ask a small Gemini model for a one-line situating context (best-effort)."""
     api_key = os.getenv("GEMINI_API_KEY", "")
@@ -71,9 +100,16 @@ def _llm_context(child_text: str, parent_text: str) -> Optional[str]:
         return None
 
 
-def enrich(child_text: str, parent_text: str, metadata: Dict[str, object]) -> str:
-    """Return the text to embed: metadata prefix (+ optional LLM ctx) + chunk."""
-    prefix = build_metadata_prefix(metadata)
+def enrich(child, parent_text: str, metadata: Dict[str, object]) -> str:
+    """
+    Return the text to EMBED: context prefix (+ optional LLM ctx) + chunk.
+
+    `child` is the ChildChunk — the prefix needs its section path and page, not
+    just its text. What is stored and returned to the model stays `child.text`,
+    untouched: the prefix exists only to steer the vector.
+    """
+    child_text = getattr(child, "text", child)
+    prefix = build_context_prefix(child, metadata)
     pieces = [prefix] if prefix else []
 
     if os.getenv("RAG_LLM_ENRICH", "0") == "1":

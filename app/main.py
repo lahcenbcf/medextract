@@ -37,9 +37,14 @@ from app.llm.correction_graph import (
     run_classification,
     run_module_classification,
 )
-from app.rag.ingest import ingest_text, retrieve
+from app.rag.ingest import ingest_ocr_response, ingest_text, retrieve
 from app.rag.jobs import create_job, get_job, list_jobs, update_job
-from app.rag.vector_store import delete_by_metadata, list_sources
+from app.rag.inspector import inspect_pdf
+from app.rag.vector_store import (
+    delete_by_metadata,
+    file_urls_for_source,
+    list_sources,
+)
 
 
 @asynccontextmanager
@@ -282,6 +287,242 @@ def _friendly_ingest_error(exc: Exception) -> str:
     return raw
 
 
+# ═══ Batch OCR — three stateless steps, driven by z_api ════════════════
+#
+# The durable state lives in z_api's KbDocument row, NOT here: a batch on a
+# thousand-page book can run for hours, and this service's job registry is
+# in-memory. These endpoints are deliberately thin.
+
+
+@app.post("/rag/ocr/submit")
+async def rag_ocr_submit(
+    file: UploadFile = File(...),
+    sha256: str = Form(...),
+    content_page_start: int | None = Form(default=None),
+    content_page_end: int | None = Form(default=None),
+    skip_pages: str = Form(default=""),
+):
+    """
+    Queue a batch OCR job. Returns immediately with the ids to persist.
+
+    Cache-first: an already-OCR'd book returns `cached: true` and no job — the
+    caller then goes straight to /rag/ocr/finalize, free of charge.
+    """
+    from app.rag.ocr4 import cache as ocr_cache
+    from app.rag.ocr4.client import page_spec, submit_batch
+
+    if not (file.filename or "").lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="OCR applies to .pdf only")
+    if not sha256.strip():
+        raise HTTPException(status_code=400, detail="sha256 is required (cache key)")
+
+    if ocr_cache.load(sha256.strip()) is not None:
+        return {"cached": True, "ocrRawUri": ocr_cache.cache_uri(sha256.strip())}
+
+    data = await file.read()
+    skip = [int(x) for x in skip_pages.split(",") if x.strip().isdigit()]
+    pages = page_spec(content_page_start, content_page_end, skip)
+    try:
+        return {"cached": False, **submit_batch(data, file.filename, sha256.strip(), pages)}
+    except Exception as exc:
+        print(f"[rag/ocr/submit] failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"OCR submission failed: {exc}")
+
+
+@app.get("/rag/ocr/batch/{batch_job_id}")
+def rag_ocr_batch_status(batch_job_id: str):
+    """Poll a batch job. Cheap and safe to call on a schedule."""
+    from app.rag.ocr4.client import get_batch
+
+    try:
+        return get_batch(batch_job_id)
+    except Exception as exc:
+        print(f"[rag/ocr/batch] failed: {exc}")
+        raise HTTPException(status_code=502, detail=f"Batch status failed: {exc}")
+
+
+def _annotate_figures_if_needed(
+    raw: dict, metadata: dict, pdf_bytes: bytes | None = None
+) -> tuple[dict, bool]:
+    """
+    Recover the text locked inside image regions.
+
+    Measured on a real book: 5 of 39 pages came back with barely 350 characters
+    because their boxed clinical content was typed as an `image`. A complete
+    answer to an exam question existed only as a picture, so retrieval could
+    never find it. Targeted at pages with a large figure — annotation is billed
+    per page and a vision call at every publisher logo would be waste.
+
+    Best-effort: losing the annotations costs recall, losing the whole ingestion
+    costs the OCR too.
+    """
+    from app.rag.ocr4.client import annotate_figures, figure_pages, merge_annotations
+
+    pages = figure_pages(raw)
+    if not pages:
+        return raw, False
+
+    try:
+        data = pdf_bytes
+        if data is None:
+            # Fallback only. z_api normally streams the file with the request:
+            # it already holds it, and this download crosses the public internet
+            # from inside a container — it timed out on a real ingestion and
+            # silently cost us the annotations of a whole book.
+            file_url = metadata.get("file_url")
+            if not file_url:
+                print("[rag/ocr] figures need annotation but no file — skipped")
+                return raw, False
+            import requests
+
+            # Separate connect/read timeouts: 300s to merely OPEN a socket turns
+            # an unreachable host into a five-minute hang.
+            resp = requests.get(file_url, timeout=(10, 180))
+            resp.raise_for_status()
+            data = resp.content
+
+        annotations = annotate_figures(
+            data, metadata.get("source") or "document.pdf", pages
+        )
+        if not annotations:
+            return raw, False
+        print(f"[rag/ocr] annotated {len(annotations)} page(s) of figures")
+        # `merge_annotations` mutates in place, so identity cannot signal a
+        # change — the caller needs an explicit flag to know it must re-cache.
+        return merge_annotations(raw, annotations), True
+    except Exception as exc:  # noqa: BLE001
+        print(f"[rag/ocr] figure annotation failed (continuing): {exc}")
+        return raw, False
+
+
+def _run_batch_finalize(
+    job_id: str,
+    sha256: str,
+    output_file_id: str | None,
+    file_id: str | None,
+    batch_file_id: str | None,
+    metadata: dict,
+    pdf_bytes: bytes | None = None,
+) -> None:
+    """Background worker: fetch the batch output → cache → chunk → index."""
+    from app.rag.ocr4 import cache as ocr_cache
+    from app.rag.ocr4.client import batch_cost, billed_pages, cleanup_batch, fetch_batch_result
+
+    update_job(job_id, status="processing")
+    try:
+        raw = ocr_cache.load(sha256)
+        cached = raw is not None
+        if raw is None:
+            if not output_file_id:
+                raise RuntimeError("No cached result and no batch output file")
+            raw = fetch_batch_result(output_file_id)
+            # Only now, with the results in hand, is it safe to delete our
+            # copies from Mistral's storage.
+            cleanup_batch(file_id, batch_file_id)
+
+        # Annotation runs on BOTH paths, not just on a cache miss. A response
+        # cached before this pass existed has figures and no transcriptions —
+        # re-indexing it would silently keep the book blind, which is exactly
+        # what happened to the first book. `figure_pages` skips already
+        # annotated images, so a second run over a complete cache costs nothing.
+        raw, newly_annotated = _annotate_figures_if_needed(raw, metadata, pdf_bytes)
+        if newly_annotated or not cached:
+            # Cache BEFORE indexing, annotations included: if chunking then
+            # crashes, both paid steps are banked and the retry costs nothing.
+            ocr_cache.store(sha256, raw)
+
+        result = ingest_ocr_response(raw, metadata)
+        pages_billed = 0 if cached else billed_pages(raw)
+        update_job(
+            job_id,
+            status="done",
+            chunks=result["chunks"],
+            parents=result["parents"],
+            ocrCached=cached,
+            ocrRawUri=ocr_cache.cache_uri(sha256),
+            ocrPagesBilled=pages_billed,
+            ocrCostUsd=0.0 if cached else batch_cost(pages_billed),
+        )
+        print(f"[rag/ocr/finalize] job {job_id} done: {result}")
+    except Exception as exc:
+        print(f"[rag/ocr/finalize] job {job_id} failed: {exc}")
+        update_job(job_id, status="failed", error=str(exc))
+
+
+@app.post("/rag/ocr/finalize", status_code=202)
+async def rag_ocr_finalize(
+    background: BackgroundTasks,
+    file: UploadFile | None = File(default=None),
+    sha256: str = Form(...),
+    output_file_id: str = Form(default=""),
+    file_id: str = Form(default=""),
+    batch_file_id: str = Form(default=""),
+    year: str = Form(default=""),
+    module: str = Form(default=""),
+    course: str = Form(default=""),
+    source: str = Form(default=""),
+    doc_type: str = Form(default="reference", alias="type"),
+    file_url: str = Form(default=""),
+):
+    """Turn a finished (or cached) OCR result into indexed chunks."""
+    metadata = {
+        k: v
+        for k, v in {
+            "year": year,
+            "module": module,
+            "course": course,
+            "type": doc_type,
+            "source": source,
+            "file_url": file_url,
+        }.items()
+        if v
+    }
+    # The original PDF, streamed by z_api over the internal network so the
+    # figure-annotation pass never depends on reaching the CDN itself.
+    pdf_bytes = await file.read() if file is not None else None
+
+    job_id = create_job(metadata)
+    background.add_task(
+        _run_batch_finalize,
+        job_id,
+        sha256.strip(),
+        output_file_id or None,
+        file_id or None,
+        batch_file_id or None,
+        metadata,
+        pdf_bytes,
+    )
+    return {"jobId": job_id, "status": "queued"}
+
+
+@app.post("/rag/inspect")
+async def rag_inspect(
+    file: UploadFile = File(...),
+    thumbnails: bool = Form(default=True),
+):
+    """
+    Propose an ingestion route for a PDF — free, local, no API call.
+
+    Deliberately does NOT touch the index or the job registry: it only reports.
+    z_api owns the registry row and the approval gate; this endpoint just gives
+    the admin the evidence to decide with.
+    """
+    name = (file.filename or "").lower()
+    if not name.endswith(".pdf"):
+        # .docx is always a text format — there is nothing to OCR.
+        raise HTTPException(
+            status_code=400, detail="Inspection only applies to .pdf files"
+        )
+    try:
+        data = await file.read()
+        return inspect_pdf(data, with_thumbnails=thumbnails)
+    except HTTPException:
+        raise
+    except Exception as exc:
+        print(f"[rag/inspect] failed: {exc}")
+        raise HTTPException(status_code=422, detail=f"Could not inspect PDF: {exc}")
+
+
 @app.post("/rag/ingest", status_code=202)
 async def rag_ingest(
     background: BackgroundTasks,
@@ -292,12 +533,14 @@ async def rag_ingest(
     course: str = Form(default=""),
     source: str = Form(default=""),
     doc_type: str = Form(default="course", alias="type"),
+    file_url: str = Form(default=""),
 ):
     """
     Add a document to the Local Knowledge Base.
 
     Accepts either an uploaded .pdf/.docx or raw `text`, plus the metadata used
-    for strict filtering at retrieval time. Returns immediately with a jobId —
+    for strict filtering at retrieval time, and an optional `file_url` pointing
+    at the stored original (so the admin can open the cited page). Returns immediately with a jobId —
     the chunk/enrich/embed/store work runs in the background so the admin UI
     never blocks. Poll GET /rag/status/{job_id}.
     """
@@ -325,6 +568,10 @@ async def rag_ingest(
         "course": course,
         "type": doc_type,
         "source": resolved_source,
+        # Where the ORIGINAL file lives (z_api uploaded it to the CDN before
+        # forwarding). Carried into every chunk so a grounded answer can be
+        # opened at its page. Not a filter key — purely informational.
+        "file_url": file_url,
     }
     metadata = {k: v for k, v in metadata.items() if v}
 
@@ -403,8 +650,12 @@ def rag_delete_source(req: RagDeleteRequest):
     if not source:
         raise HTTPException(status_code=400, detail="source is required")
     try:
+        # Read the stored originals BEFORE dropping the chunks — afterwards the
+        # only record of where the file lives is gone. z_api uses these to clean
+        # up the CDN.
+        file_urls = file_urls_for_source(source)
         delete_by_metadata({"source": source})
-        return {"deleted": source}
+        return {"deleted": source, "fileUrls": file_urls}
     except Exception as exc:
         print(f"[rag/sources delete] failed: {exc}")
         raise HTTPException(status_code=502, detail="Could not delete source") from exc

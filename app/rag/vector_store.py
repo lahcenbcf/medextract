@@ -18,6 +18,7 @@ from qdrant_client.models import (
     FieldCondition,
     Filter,
     MatchValue,
+    MatchAny,
     PointStruct,
     VectorParams,
 )
@@ -27,7 +28,7 @@ from .embeddings import EMBED_DIM
 COLLECTION = os.getenv("QDRANT_COLLECTION", "nobles_kb")
 
 # Metadata keys eligible for strict filtering.
-FILTERABLE_KEYS = ("year", "module", "type", "course", "source")
+FILTERABLE_KEYS = ("year", "module", "type", "course", "source", "kind")
 
 _client: Optional[QdrantClient] = None
 
@@ -42,6 +43,19 @@ def get_client() -> QdrantClient:
     return _client
 
 
+# Fields worth an index. Without them every filtered query degenerates into a
+# full scan — the difference between 20 ms and 2 s on a book-scale corpus.
+_INDEXED_FIELDS = {
+    "source": "keyword",
+    "module": "keyword",
+    "year": "keyword",
+    "course": "keyword",
+    "type": "keyword",
+    "kind": "keyword",
+    "page": "integer",
+}
+
+
 def ensure_collection() -> None:
     """Create the collection on first use (idempotent)."""
     client = get_client()
@@ -50,15 +64,42 @@ def ensure_collection() -> None:
             collection_name=COLLECTION,
             vectors_config=VectorParams(size=EMBED_DIM, distance=Distance.COSINE),
         )
+    _ensure_payload_indexes(client)
+
+
+def _ensure_payload_indexes(client) -> None:
+    """
+    Create the payload indexes, tolerating the ones that already exist.
+
+    Idempotent by design: this runs on every ingestion, and an existing index
+    must not be an error. Failures are logged, never raised — a missing index
+    makes queries slower, not wrong.
+    """
+    for field, schema in _INDEXED_FIELDS.items():
+        try:
+            client.create_payload_index(
+                collection_name=COLLECTION, field_name=field, field_schema=schema
+            )
+        except Exception as exc:  # noqa: BLE001 - already-exists is the common case
+            msg = str(exc).lower()
+            if "already exists" not in msg and "conflict" not in msg:
+                print(f"[vector_store] payload index on {field!r} skipped: {exc}")
 
 
 def build_filter(metadata: Dict[str, Any]) -> Optional[Filter]:
-    """Build a strict AND filter from the provided metadata keys."""
-    conditions = [
-        FieldCondition(key=key, match=MatchValue(value=metadata[key]))
-        for key in FILTERABLE_KEYS
-        if metadata.get(key) not in (None, "")
-    ]
+    """Build a strict AND filter from the provided metadata keys (case-insensitive fallback)."""
+    conditions = []
+    for key in FILTERABLE_KEYS:
+        val = metadata.get(key)
+        if val not in (None, ""):
+            if isinstance(val, str):
+                # Search for exactly what was passed, plus common case variations
+                # because Qdrant keyword matching is strictly case-sensitive.
+                variants = list({val, val.upper(), val.lower(), val.capitalize()})
+                conditions.append(FieldCondition(key=key, match=MatchAny(any=variants)))
+            else:
+                conditions.append(FieldCondition(key=key, match=MatchValue(value=val)))
+                
     return Filter(must=conditions) if conditions else None
 
 
@@ -77,14 +118,47 @@ def search(
 ) -> List[Dict[str, Any]]:
     """Metadata-filtered semantic search over child chunks."""
     ensure_collection()
-    hits = get_client().search(
+    resp = get_client().query_points(
         collection_name=COLLECTION,
-        query_vector=query_vector,
+        query=query_vector,
         query_filter=build_filter(metadata or {}),
         limit=limit,
         with_payload=True,
     )
-    return [{"score": h.score, **(h.payload or {})} for h in hits]
+    return [{"score": h.score, **(h.payload or {})} for h in resp.points]
+
+
+def file_urls_for_source(source: str) -> List[str]:
+    """
+    The stored original(s) behind one document, read from the chunk payloads.
+
+    The uploaded filename and the `source` tag can differ (the admin may rename
+    the source at import), so the URL cannot be rebuilt from the name — it has
+    to be read back from what was indexed. Called just before deleting the
+    chunks, while they still exist.
+    """
+    client = get_client()
+    if not client.collection_exists(COLLECTION):
+        return []
+
+    urls: List[str] = []
+    offset = None
+    while True:
+        points, offset = client.scroll(
+            collection_name=COLLECTION,
+            scroll_filter=build_filter({"source": source}),
+            with_payload=True,
+            with_vectors=False,
+            limit=256,
+            offset=offset,
+        )
+        for p in points:
+            url = (p.payload or {}).get("file_url")
+            if url and url not in urls:
+                urls.append(url)
+        if offset is None:
+            break
+    return urls
 
 
 def delete_by_metadata(metadata: Dict[str, Any]) -> None:

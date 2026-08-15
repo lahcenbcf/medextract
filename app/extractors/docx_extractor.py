@@ -107,6 +107,13 @@ def extract_docx(file_bytes: bytes) -> tuple[str, dict[str, io.BytesIO]]:
             # Extract text with run-level bold detection
             line = _extract_rich_text(para).strip()
             if line:
+                # A .docx has no pages (pagination is a rendering artefact), so
+                # headings are the only stable localisation we can cite.
+                try:
+                    if (para.style.name or "").lower().startswith("heading"):
+                        lines.append(f"<!--loc:section={line[:80]}-->")
+                except Exception:
+                    pass
                 lines.append(line)
 
         elif isinstance(block, CT_Tbl):
