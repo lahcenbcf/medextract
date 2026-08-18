@@ -8,7 +8,7 @@ as medical English written for medical students.
 
 from typing import Any, Dict, List, Optional
 
-from app.llm.correction_graph import _gemini_generate
+from app.llm.correction_graph import _field, _gemini_generate, _log, _rule
 
 import json
 import logging
@@ -90,8 +90,13 @@ def _glossary_block(glossary: Optional[List[Dict[str, Any]]]) -> str:
         return ""
     lines = []
     for e in entries:
-        note = f"  ({e['note']})" if e.get("note") else ""
-        lines.append(f"- « {e['termFr']} » → « {e['termEn'] }»{note}")
+        # The SENSE comes first when there is one: a term carrying a sense is a
+        # term that has more than one English equivalent, so the model receives
+        # two lines for it and this is the only thing telling them apart.
+        # "bilan → workup" and "bilan → panel" are otherwise a contradiction.
+        hint = e.get("sense") or e.get("note") or ""
+        suffix = f"  ({hint})" if hint else ""
+        lines.append(f"- « {e['termFr']} » → « {e['termEn']} »{suffix}")
     return (
         "\n\n## LEXIQUE IMPOSÉ (priorité absolue)\n"
         "Pour les termes ci-dessous, tu DOIS employer EXACTEMENT la traduction fournie, "
@@ -154,6 +159,28 @@ def translate_question(
     """
     target = "anglais" if language == "en" else language
     lexicon = _glossary_block(glossary)
+
+    # What the model is actually told about vocabulary. Printed in full because
+    # the failure this catches is silent: a lexicon that arrives empty, or a
+    # term imposed on a word that only looked like it, produces a translation
+    # that reads fine and is wrong.
+    entries = [e for e in (glossary or []) if e.get("termFr") and e.get("termEn")]
+    _log()
+    _rule("TRADUCTION · LEXIQUE IMPOSÉ", "═")
+    if not entries:
+        _log("  ⚠ AUCUN terme imposé — le modèle traduit tout librement")
+    else:
+        _log(f"  {len(entries)} terme(s) reçu(s) de z_api")
+        for e in entries:
+            hint = e.get("sense") or e.get("note") or ""
+            flag = " [abrév.]" if e.get("isAbbrev") else ""
+            _log(f"    « {e['termFr']} » → « {e['termEn']} »{flag}")
+            if hint:
+                _log(f"        ↳ {hint}")
+        _field("BLOC INJECTÉ DANS LE PROMPT SYSTÈME", lexicon, 700)
+    _rule("", "═")
+    _log()
+
     base_prompt = (
         f"Traduis en {target} la question suivante, en respectant STRICTEMENT "
         f"les règles (libellés, combinaisons, HTML, aucun ajout, AUCUNE omission)"

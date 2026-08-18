@@ -289,10 +289,23 @@ def batch_cost(page_count: int) -> float:
 # — never existed as text and so could never be retrieved. This pass sends those
 # regions to a vision model and transcribes them back.
 
-FIGURE_PASS_MIN_AREA = 0.10  # page fraction below which a picture is decorative
-# `image_limit` caps images PER CALL and drops the overflow without an error,
-# so the pass is batched small enough that the cap is never reached.
-ANNOTATE_PAGES_PER_CALL = 3
+# Page fraction below which a picture is assumed decorative.
+#
+# ZERO, i.e. annotate every figure. It was 0.10, on the theory that a small
+# image is a publisher logo — and that theory cost this corpus most of its
+# figures: 30 of 41 images sat below the bar, among them the 6.4% region
+# holding stages I and II of the Leriche-Fontaine classification. Only 3% of
+# the images below the threshold ever got a transcription, against 91% above.
+#
+# The bar existed to control spend. Measured on the real book, annotating
+# EVERY figure costs 0.125 USD — 25 pages at Document AI pricing. There was no
+# spend to control. Raise it via the environment for a corpus whose images
+# really are decorative; never raise it to save money.
+FIGURE_PASS_MIN_AREA = float(os.getenv("OCR4_FIGURE_MIN_AREA", "0"))
+# `image_limit` caps images PER CALL and drops the overflow WITHOUT an error.
+# Batches are therefore built by image count, not by page count: three pages
+# carrying four figures each would silently lose four of them, and the loss is
+# invisible — the response simply comes back short.
 IMAGES_PER_CALL = 8
 PRICE_DOCAI_PER_PAGE = 0.005
 
@@ -333,14 +346,49 @@ def figure_pages(
     return out
 
 
+def _annotation_batches(
+    pages: List[int], images_per_page: Dict[int, int] | None
+) -> List[List[int]]:
+    """
+    Group pages so no single call can exceed `IMAGES_PER_CALL`.
+
+    Batching by PAGE count was a coin toss: three pages carrying four figures
+    each is twelve images against a cap of eight, and the four that overflow are
+    dropped with no error. Counting the images we already know about removes the
+    guesswork. Without a count (caller did not supply one) we assume the
+    worst — one page per call — rather than gamble.
+    """
+    out: List[List[int]] = []
+    batch: List[int] = []
+    load = 0
+    for page in pages:
+        n = max(1, (images_per_page or {}).get(page, IMAGES_PER_CALL))
+        # A single page with more images than the cap still has to go alone;
+        # nothing here can rescue it, but it must not drag neighbours down.
+        if batch and load + n > IMAGES_PER_CALL:
+            out.append(batch)
+            batch, load = [], 0
+        batch.append(page)
+        load += n
+    if batch:
+        out.append(batch)
+    return out
+
+
 def annotate_figures(
-    file_bytes: bytes, filename: str, pages: List[int]
+    file_bytes: bytes,
+    filename: str,
+    pages: List[int],
+    images_per_page: Dict[int, int] | None = None,
 ) -> Dict[int, Dict[str, Any]]:
     """
     Transcribe the text inside figure regions, page by page.
 
     Returns {page_index: {image_id: annotation}} so the caller can merge it into
     the cached OCR response — after which re-chunking stays free.
+
+    `images_per_page` lets the caller size the batches from the response it
+    already has; see `_annotation_batches`.
     """
     if not pages:
         return {}
@@ -377,8 +425,7 @@ def annotate_figures(
         # and silently drops the rest: asking for ten pages at once returned
         # annotations for the first eight images only — the page we actually
         # needed was among the dropped ones, with no error anywhere.
-        for start in range(0, len(pages), ANNOTATE_PAGES_PER_CALL):
-            batch = pages[start : start + ANNOTATE_PAGES_PER_CALL]
+        for batch in _annotation_batches(pages, images_per_page):
             resp = cl.ocr.process(
                 model=OCR_MODEL,
                 document={"type": "document_url", "document_url": url},
@@ -388,7 +435,11 @@ def annotate_figures(
                 ),
                 # REQUIRED: the crop has to be sent to the vision model.
                 include_image_base64=True,
-                image_min_size=120,
+                # No `image_min_size`: the base OCR call sets none, so any floor
+                # here would return a DIFFERENT set of regions than the cached
+                # response holds — small figures would simply never come back,
+                # and the ones that did would be cropped on other boundaries.
+                # The two calls must see the same page the same way.
                 image_limit=IMAGES_PER_CALL,
             )
             raw = _json.loads(resp.model_dump_json())
@@ -426,20 +477,105 @@ def _bbox_key(img: Dict[str, Any]) -> tuple:
     )
 
 
+# How much of the SMALLER box must fall inside the other for the two to be the
+# same content. Measured against the real responses, this covers both ways the
+# region detector disagrees with itself between calls:
+#
+#   drift — the same figure comes back 1-5 px off (ratio ≈ 0.99);
+#   split — one cached image comes back as two stacked halves (ratio 1.0 for
+#           each half, while their mutual IoU with the whole is only 0.49).
+#
+# Two genuinely different figures on a page score 0.
+BBOX_MATCH_MIN_OVERLAP = 0.7
+
+
+def _overlap_ratio(a: tuple, b: tuple) -> float:
+    """Intersection as a fraction of the SMALLER of the two boxes."""
+    ix0, iy0 = max(a[0], b[0]), max(a[1], b[1])
+    ix1, iy1 = min(a[2], b[2]), min(a[3], b[3])
+    if ix1 <= ix0 or iy1 <= iy0:
+        return 0.0
+    inter = (ix1 - ix0) * (iy1 - iy0)
+    area_a = max(0, a[2] - a[0]) * max(0, a[3] - a[1])
+    area_b = max(0, b[2] - b[0]) * max(0, b[3] - b[1])
+    smaller = min(area_a, area_b)
+    return inter / smaller if smaller > 0 else 0.0
+
+
+def _combine_annotations(parts: List[Any]) -> Any:
+    """
+    Fuse the annotations of one region that came back split into several.
+
+    Keeping only one half would leave the figure half-read — and on this corpus
+    a figure IS the content, so half a transcription is a wrong answer waiting
+    to happen.
+    """
+    if len(parts) == 1:
+        return parts[0]
+    import json as _json
+
+    texts, descs, ftype = [], [], ""
+    for part in parts:
+        try:
+            d = _json.loads(part) if isinstance(part, str) else part
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        ftype = ftype or (d.get("figure_type") or "")
+        if (d.get("transcribed_text") or "").strip():
+            texts.append(d["transcribed_text"].strip())
+        if (d.get("description") or "").strip():
+            descs.append(d["description"].strip())
+    if not texts and not descs:
+        return parts[0]
+    return _json.dumps(
+        {
+            "figure_type": ftype or "diagram",
+            "transcribed_text": "\n".join(texts),
+            "description": " ".join(descs),
+        },
+        ensure_ascii=False,
+    )
+
+
 def merge_annotations(
     raw: Dict[str, Any], annotations: Dict[int, Dict[Any, Any]]
 ) -> Dict[str, Any]:
-    """Fold annotations into the OCR response, so the CACHE carries them too."""
+    """
+    Fold annotations into the OCR response, so the CACHE carries them too.
+
+    Matched by OVERLAP, not by equality. Coordinates are the only stable
+    identity across calls — image ids restart per response — but they are not
+    stable to the pixel: measured on this book, the same region came back as
+    (85, 175, 622, 572) from the base call and (85, 174, 617, 568) from the
+    annotation pass. Exact-integer keys dropped that transcription on the floor,
+    and the page kept a figure nobody could read. A one-pixel wobble in a region
+    detector must never cost a page its content.
+    """
     merged = 0
     for page in raw.get("pages") or []:
-        page_ann = annotations.get(int(page.get("index", 0)))
+        # Copied, and entries removed as they are used: one annotation must not
+        # be claimed by two regions.
+        page_ann = dict(annotations.get(int(page.get("index", 0))) or {})
         if not page_ann:
             continue
         for img in page.get("images") or []:
-            ann = page_ann.get(_bbox_key(img))
-            if ann:
-                img["image_annotation"] = ann
-                merged += 1
+            key = _bbox_key(img)
+            exact = page_ann.pop(key, None)  # the common case
+            parts = [exact] if exact is not None else []
+            if not parts and page_ann:
+                # EVERY overlapping region, not the best one: a figure that came
+                # back split into halves must be reassembled, not halved.
+                for candidate in [
+                    k
+                    for k in page_ann
+                    if _overlap_ratio(key, k) >= BBOX_MATCH_MIN_OVERLAP
+                ]:
+                    parts.append(page_ann.pop(candidate))
+            if parts:
+                img["image_annotation"] = _combine_annotations(parts)
+                merged += len(parts)
     expected = sum(len(v) for v in annotations.values())
     if merged < expected:
         # Loud on purpose: a silent partial merge is what cost a whole book its

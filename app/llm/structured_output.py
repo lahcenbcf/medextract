@@ -20,8 +20,9 @@ import os
 import re
 import json
 import time
-from typing import Optional
+from typing import Any, Dict, Optional
 from app.schemas import LLMExtractionOutput, LLMQuestionOutput, LLMClinicalCase
+from app.llm.correction_graph import thinking_config
 
 # ─── Configuration ───────────────────────────────────────────────────────
 
@@ -565,17 +566,22 @@ def extract_with_gemini(
             f"({len(chunk['text'])} chars)..."
         )
 
+        generation_config: Dict[str, Any] = {
+            "temperature": 0.1,
+            "responseMimeType": "application/json",
+            "responseSchema": GEMINI_EXTRACTION_SCHEMA,
+            # Generous ceiling: a dense chunk with per-choice explanations
+            # produces a lot of JSON, and truncation loses the whole chunk.
+            "maxOutputTokens": 32768,
+        }
+        thinking = thinking_config(model)
+        if thinking:
+            generation_config["thinkingConfig"] = thinking
+
         body = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "system_instruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "generationConfig": {
-                "temperature": 0.1,
-                "responseMimeType": "application/json",
-                "responseSchema": GEMINI_EXTRACTION_SCHEMA,
-                # Generous ceiling: a dense chunk with per-choice explanations
-                # produces a lot of JSON, and truncation loses the whole chunk.
-                "maxOutputTokens": 32768,
-            },
+            "generationConfig": generation_config,
         }
 
         result: Optional[LLMExtractionOutput] = None

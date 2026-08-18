@@ -381,8 +381,15 @@ def _annotate_figures_if_needed(
             resp.raise_for_status()
             data = resp.content
 
+        # Batch sizing needs the image count we already have in the response;
+        # without it the pass gambles on how many figures a page holds and the
+        # overflow is dropped silently.
+        images_per_page = {
+            int(p.get("index", 0)): len(p.get("images") or [])
+            for p in (raw.get("pages") or [])
+        }
         annotations = annotate_figures(
-            data, metadata.get("source") or "document.pdf", pages
+            data, metadata.get("source") or "document.pdf", pages, images_per_page
         )
         if not annotations:
             return raw, False

@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import textwrap
 import time
 from typing import Any, Dict, List, Optional, TypedDict
 
@@ -36,15 +37,74 @@ from pydantic import (
 )
 from langgraph.graph import StateGraph, END
 
-from app.rag.ingest import retrieve
+from app.rag.ingest import retrieve_many
 
 
 GEMINI_ENDPOINT = "https://generativelanguage.googleapis.com/v1beta/models"
-# Three, not five: the two tail hits were consistently off-topic on the corpus
-# we measured. Fewer blocks means less noise in the model's context — but the
-# dense ranking only separates first from fifth by 0.04, so this is a bet on the
-# ranking being right. The cross-encoder reranker is what makes it a safe one.
-RAG_TOP_K = int(os.getenv("RAG_TOP_K", "3"))
+# A PER-QUESTION budget: every question in a paste gets its own search.
+#
+# ONE. Three became two when the third slot started holding a figure whose whole
+# content was "Illustration © mgundj"; two became one because per-question
+# retrieval made the first hit reliably the right one, and every extra section
+# is prose the model must read before answering.
+#
+# This is the tightest setting that still grounds an answer, and it has no
+# margin: if the best section is wrong, the question has nothing else to fall
+# back on. Raise it with RAG_TOP_K=2 — no redeploy needed — if answers start
+# citing the right page but the wrong passage.
+RAG_TOP_K = int(os.getenv("RAG_TOP_K", "1"))
+# What the model finally receives, across every question. Without a ceiling a
+# ten-question paste would carry thirty sections into the prompt and give back
+# in prefill what per-question retrieval gains in accuracy.
+RAG_MAX_CHUNKS = int(os.getenv("RAG_MAX_CHUNKS", "8"))
+# Beyond this many questions in one paste, retrieval stops splitting: the tail
+# questions would get one chunk each at best, and the caps above bind anyway.
+RAG_MAX_QUESTIONS = int(os.getenv("RAG_MAX_QUESTIONS", "8"))
+
+
+# ─── Debug console ─────────────────────────────────────────────────────
+# One place for everything this pipeline writes to stdout, so
+# `docker compose logs -f medextract` reads as a trace rather than as scattered
+# prints. Set CORRECTION_DEBUG=0 to silence it without touching the code.
+#
+# `flush=True` throughout: Python buffers stdout when it is not a TTY, and under
+# Docker that means the trace of a request arrives long after the request did.
+DEBUG = os.getenv("CORRECTION_DEBUG", "1").lower() not in ("0", "false", "no")
+_WIDTH = 78
+
+
+def _log(msg: str = "") -> None:
+    if DEBUG:
+        print(msg, flush=True)
+
+
+def _rule(title: str = "", char: str = "─") -> None:
+    """A separator, optionally carrying a title."""
+    if not DEBUG:
+        return
+    if not title:
+        print(char * _WIDTH, flush=True)
+        return
+    head = f"{char * 3} {title} "
+    print(head + char * max(3, _WIDTH - len(head)), flush=True)
+
+
+def _field(label: str, value: Any, limit: int = 0) -> None:
+    """
+    A labelled block of text, whitespace-collapsed, wrapped and indented.
+
+    Collapsing the whitespace matters: chunk text is full of newlines, and one
+    section printed raw swamps the twenty lines around it.
+    """
+    if not DEBUG:
+        return
+    raw = "" if value is None else str(value)
+    text = " ".join(raw.split())
+    if limit and len(text) > limit:
+        text = f"{text[:limit]}… (+{len(text) - limit} car.)"
+    print(f"  {label}", flush=True)
+    for line in textwrap.wrap(text, _WIDTH - 6) or ["(vide)"]:
+        print(f"      {line}", flush=True)
 
 
 # ─── Pydantic models (structured-output validation) ────────────────────
@@ -91,7 +151,9 @@ class CorrectionQuestion(BaseModel):
     # per-option commentary lives on each choice, the student-facing recap in
     # `globalComment`.
     explanation: str = ""
-    # Student-facing recap of the whole question (HTML table allowed).
+    # Student-facing recap of the whole question. Any comparative table is
+    # emitted as MARKDOWN and converted to HTML at the display boundary
+    # (NoblesQcm/lib/html.ts) — HTML here would cost tokens for nothing.
     globalComment: str = ""
     # Clinical case: the shared/preceding context for THIS question (patient
     # intro, new lab results…) — empty for a standalone question — and the
@@ -165,14 +227,29 @@ QUESTION_RESPONSE_SCHEMA: Dict[str, Any] = {
         "correctAnswers": {"type": "STRING"},
         # Reviewer alerts only; the per-option commentary is on each choice.
         "explanation": {"type": "STRING"},
-        # Student-facing recap of the question (HTML table allowed).
+        # Student-facing recap. Comparative tables are Markdown (converted to HTML
+        # for display); see toDisplayHtml in NoblesQcm/lib/html.ts.
         "globalComment": {"type": "STRING"},
         "caseDescription": {"type": "STRING"},
         "caseIndex": {"type": "INTEGER", "nullable": True},
         # Résidanat only: "biologie" | "chirurgie" | "medecine" (empty otherwise).
         "epreuve": {"type": "STRING", "nullable": True},
     },
-    "required": ["description", "isKtype", "choices", "correctAnswers", "explanation"],
+    # `caseIndex` is required-but-nullable ON PURPOSE: the model must decide,
+    # for every question, whether it belongs to a clinical case (0, 1, 2…) or
+    # stands alone (null). Since the case text is now written only once and
+    # redistributed afterwards, that flag is the ONLY membership signal — left
+    # optional, a model that simply omitted it would strand the later questions
+    # of a case with no context at all. Three tokens per question for a signal
+    # we cannot reconstruct.
+    "required": [
+        "description",
+        "isKtype",
+        "choices",
+        "correctAnswers",
+        "explanation",
+        "caseIndex",
+    ],
 }
 
 # The admin may paste several questions at once → return a LIST.
@@ -244,6 +321,31 @@ def _post_gemini(url: str, body: Dict[str, Any], timeout: int = 110):
     raise last_exc  # type: ignore[misc]
 
 
+def thinking_config(model: str) -> Optional[Dict[str, Any]]:
+    """
+    Cap the thinking budget on the models that have one, nothing elsewhere.
+
+    Correction latency is dominated by the dead time BEFORE the first output
+    token, and `gemini-flash-latest` — the default — thinks by default: measured
+    against the live API, a trivial "Dis OK." prompt burned 248 thinking tokens
+    unprompted, 41 with a zero budget. On a full correction prompt that gap is
+    what the corrector spends staring at a spinner.
+
+    Two guards, both measured rather than assumed:
+
+      * The 1.5/2.0 series has no thinking mode — the field is meaningless there.
+      * Pro REFUSES a zero budget: `gemini-pro-latest` answers
+        `400 Budget 0 is invalid. This model only works in thinking mode.`
+        128 is its floor and still roughly halves what it spends (423 → 228).
+
+    Without the Pro guard, correction would break outright the moment an admin
+    switched model in the settings.
+    """
+    if "2.5" not in model and "latest" not in model:
+        return None
+    return {"thinkingBudget": 128 if "pro" in model else 0}
+
+
 def _gemini_generate(
     system_prompt: str,
     contents: List[Dict[str, Any]],
@@ -256,13 +358,21 @@ def _gemini_generate(
     api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY not configured")
-    print(f"\n[DEBUG MODEL] {model}")   
     model = model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
 
     body: Dict[str, Any] = {
         "contents": contents,
         "generationConfig": {"temperature": 0.2},
     }
+    thinking = thinking_config(model)
+    if thinking:
+        body["generationConfig"]["thinkingConfig"] = thinking
+    _log(
+        f"  → Gemini · {model} · thinking="
+        f"{thinking['thinkingBudget'] if thinking else 'défaut'}"
+        f"{' · web_search' if web_search else ''}"
+        f"{' · schéma JSON' if response_schema is not None else ''}"
+    )
     if system_prompt:
         body["system_instruction"] = {"parts": [{"text": system_prompt}]}
     if web_search:
@@ -297,6 +407,9 @@ def _gemini_grounded(
         "generationConfig": {"temperature": 0.2},
         "tools": [{"google_search": {}}],
     }
+    thinking = thinking_config(model)
+    if thinking:
+        body["generationConfig"]["thinkingConfig"] = thinking
     if system_prompt:
         body["system_instruction"] = {"parts": [{"text": system_prompt}]}
 
@@ -315,59 +428,63 @@ def _gemini_grounded(
     return text, sources
 
 
-def _rewrite_for_retrieval(message: str, model: Optional[str] = None) -> str:
-    """Extract medical keywords from a vignette to improve dense retrieval."""
-    prompt = (
-        "Extrais 3 à 6 mots-clés ou concepts médicaux précis de ce texte pour "
-        "une recherche dans un manuel de médecine (ex: syndromes, signes pathognomoniques, "
-        "traitements). Élimine les mots génériques (patient, ans, présente, clinique). "
-        "Réponds UNIQUEMENT par les mots-clés séparés par des virgules.\n\n"
-        f"{message[:1000]}"
-    )
-    try:
-        out = _gemini_generate("", [{"role": "user", "parts": [{"text": prompt}]}], model=model)
-        return out.strip() if len(out) < 150 else message
-    except Exception as exc:
-        print(f"[correction_graph] rewrite failed, using raw message: {exc}")
-        return message
-
 def _retrieve_context(state: CorrectionState) -> CorrectionState:
-    """RAG node: metadata-filtered grounding from the Local Knowledge Base."""
-    search_query = state["message"]
-    # Enhance retrieval if the query is a long clinical vignette (over 100 chars)
-    if len(search_query) > 100:
-        rewritten = _rewrite_for_retrieval(search_query, state.get("model"))
-        if rewritten and rewritten != search_query:
-            print(f"\n[DEBUG RAG] Rewrote query to: {rewritten}")
-            # Combine keywords with the original to preserve both specific terms and context
-            search_query = f"{rewritten} {search_query[:200]}"
-            
-    print(f"\n[DEBUG RAG] Retrieving for query: {search_query[:100]}...")
-    print(f"[DEBUG RAG] With metadata filter: {state.get('metadata')}")
+    """
+    RAG node: metadata-filtered grounding from the Local Knowledge Base.
+
+    One search PER question. The whole paste used to be embedded as a single
+    string — after an LLM pass distilled it to keywords — so five questions
+    shared one vector and one set of three chunks. That vector pointed at the
+    batch's centre of gravity and therefore at none of the questions: asked how
+    an atheroma plaque forms, the KB returned IDM complications, chest pain and
+    rhythm disorders, which were the OTHER questions' subjects.
+
+    The keyword-distillation pass is gone with it: it cost an LLM call on the
+    critical path, truncated the original question to 200 characters, and its
+    output mixed vocabulary across questions — one question's "Classification"
+    was enough to divert every other question's search toward tables.
+    """
+    message = state["message"]
+    # `_split_questions` prefers the preamble the message carries itself and
+    # falls back to this one, so a partial submission ("3. …" alone) still gets
+    # its patient without the two ever being prepended twice.
+    remembered = state.get("case_context") or "" if state.get("clinical_case") else ""
+    segments = _split_questions(message, remembered)
+
+    _log()
+    _rule("RAG · BASE DE CONNAISSANCES", "═")
+    _log(f"  {len(segments)} question(s) · filtre : {state.get('metadata') or '(aucun)'}")
+    _log(f"  budget : {RAG_TOP_K} extrait(s)/question, {RAG_MAX_CHUNKS} au total")
     try:
-        hits = retrieve(
-            query=search_query,
+        hits = retrieve_many(
+            queries=segments,
             metadata=state.get("metadata") or {},
             top_k=RAG_TOP_K,
+            max_total=RAG_MAX_CHUNKS,
         )
-        print(f"[DEBUG RAG] Found {len(hits)} hits.")
     except Exception as exc:  # noqa: BLE001 - never fail the chat on KB issues
-        print(f"[correction_graph] KB retrieval failed, continuing without: {exc}")
+        _rule("RAG ÉCHEC", "═")
+        _log(f"  {exc}")
+        _log("  → correction poursuivie SANS contexte")
         return {"context": ""}
 
     if not hits:
+        _log("  → AUCUN extrait trouvé — correction sans contexte")
+        _rule("", "═")
         return {"context": ""}
 
     blocks = []
     kb_sources: List[Dict[str, Any]] = []
+    positions: Dict[int, int] = {}
     for i, hit in enumerate(hits, start=1):
+        positions[id(hit)] = i
         source = hit.get("source") or "unknown"
         course = hit.get("course") or ""
         ctx = hit.get("context", "") or ""
         page = hit.get("page")
         section = hit.get("section") or ""
         # The localisation goes in the header so the model can cite it verbatim
-        # — it is the only page/section it will evercr_cache.load(sha256) legitimately know.
+        # — it is the only page/section it will ever legitimately know.
         header = f"[{i}] source: {source}"
         if page is not None:
             header += f" | page: {page}"
@@ -376,7 +493,6 @@ def _retrieve_context(state: CorrectionState) -> CorrectionState:
         if course:
             header += f" | course: {course}"
         blocks.append(f"{header}\n{ctx}")
-        print(f"[DEBUG RAG] Hit {i}: {header} | Content snippet: {ctx[:100]}...")
         # Keep the top chunk of each doc so the UI can show it on hover.
         kb_sources.append(
             {
@@ -391,7 +507,38 @@ def _retrieve_context(state: CorrectionState) -> CorrectionState:
                 "bbox": hit.get("bbox"),
             }
         )
-    return {"context": "\n\n---\n\n".join(blocks), "kb_sources": kb_sources}
+
+    # Grouped BY QUESTION, not by rank: the merge hands back one flat list, and
+    # what a reader needs is "what did THIS question ask, and what did it get".
+    for qi, seg in enumerate(segments):
+        _rule(f"Q{qi + 1}/{len(segments)}")
+        _field("REQUÊTE ENVOYÉE À LA KB", seg, 500)
+        mine = [h for h in hits if h.get("query_index") == qi]
+        if not mine:
+            _log("  ⚠ aucun extrait retenu pour cette question")
+            continue
+        for hit in mine:
+            pos = positions[id(hit)]
+            page = hit.get("page")
+            _log(
+                f"  ── extrait [{pos}] · {hit.get('source') or 'unknown'}"
+                f" · page {page} · {hit.get('kind') or 'prose'}"
+            )
+            # These two are DIFFERENT texts and the distinction matters: the
+            # child excerpt is what the vector search scored, the parent is what
+            # the model actually reads. A parent can hold the answer while the
+            # excerpt that ranked it does not.
+            _field("· extrait qui a matché (sert au CLASSEMENT)",
+                   hit.get("matched_chunk"), 220)
+            _field("· contexte ENVOYÉ AU MODÈLE (section parente)",
+                   hit.get("context"), 700)
+
+    context = "\n\n---\n\n".join(blocks)
+    _rule("", "═")
+    _log(f"  {len(hits)} extrait(s) retenu(s) · {len(context)} caractères de contexte")
+    _rule("", "═")
+    _log()
+    return {"context": context, "kb_sources": kb_sources}
 
 
 # ─── Clinical-case detection + memory (partial submissions) ────────────
@@ -412,6 +559,102 @@ def _extract_leading_context(message: str) -> str:
     """The text before the first 'N.' question = the (new) case context block."""
     m = _FIRST_Q_RE.search(message)
     return message[: m.start()].strip() if (m and m.start() > 0) else ""
+
+
+# A question stem announces itself — a question mark, or an interrogative cue.
+_Q_CUE = re.compile(
+    r"\?|\b(quelles?|quels?|parmi|cochez|indiquez|citez|donnez|pr[ée]cisez|"
+    r"concernant|laquelle|lequel|lesquell?es?|d[ée]finir|d[ée]finissez)\b",
+    re.IGNORECASE,
+)
+# An answer option: "A- …", "B) …", "1. …" — a letter OR a digit label.
+_OPTION_LABEL = re.compile(r"^\s*(?:[A-Za-z]|\d{1,2})\s*[.)\-–:]\s+\S")
+# A LETTER label is ALWAYS an option: no question stem starts with "A- ".
+_LETTER_LABEL = re.compile(r"^\s*[A-Za-z]\s*[.)\-–:]\s+\S")
+# A digit label opens either a numbered question ("1. Quelle est…") or a K-type
+# sub-proposition ("1. L'oxydation des LDL…"). Only the cue tells them apart.
+_NUM_LABEL = re.compile(r"^\s*\d{1,2}\s*[.)]\s+")
+
+
+def _is_question_start(line: str) -> bool:
+    """Does this line open a new question?"""
+    s = line.strip()
+    if not s or _LETTER_LABEL.match(s):
+        return False
+    m = _NUM_LABEL.match(s)
+    # Strip the number before looking for the cue, so "1. Quelle est…" reads as
+    # a question while "1. L'oxydation des LDL…" reads as a sub-proposition.
+    return bool(_Q_CUE.search(s[m.end() :] if m else s))
+
+
+def _has_option(segment: str) -> bool:
+    """Does this segment carry answer options of its own?"""
+    return any(_OPTION_LABEL.match(l) for l in segment.splitlines()[1:])
+
+
+def _split_questions(message: str, remembered_context: str = "") -> List[str]:
+    """
+    Cut a paste into one segment per question, so each gets its own search.
+
+    Boundaries are found by CONTENT, not by numbering. Numbering was the first
+    attempt and it failed on the most ordinary paste there is — questions typed
+    one after another with no "1." at all. Everything then landed in a single
+    query again, which is the batch-centroid problem the split exists to remove.
+
+    Three rules, each earning its place:
+
+      * a LETTER label ("A- …") is always an option, never a stem;
+      * a DIGIT label is ambiguous, so the cue is tested on what follows it —
+        that is what keeps a K-type question ("1. L'oxydation des LDL…") from
+        exploding into one search per sub-proposition;
+      * a real question carries options, so a stem split across two lines
+        ("Concernant les marqueurs…" / "quelle proposition est exacte ?")
+        merges FORWARD into the piece that does.
+
+    `remembered_context` is the case a partial submission continues; it is used
+    only when the message carries no preamble of its own, since the two overlap.
+
+    Falls back to the whole message whenever fewer than two questions are found,
+    keeping the single-question case — the common one — exactly as it was.
+    """
+    def whole() -> List[str]:
+        if remembered_context:
+            return [f"{remembered_context}\n\n{message}".strip()]
+        return [message]
+
+    lines = message.splitlines()
+    starts = [i for i, l in enumerate(lines) if _is_question_start(l)]
+    if len(starts) < 2:
+        return whole()
+
+    bounds = starts + [len(lines)]
+    segments: List[str] = []
+    pending = ""
+    for i in range(len(bounds) - 1):
+        piece = "\n".join(lines[bounds[i] : bounds[i + 1]]).strip()
+        if not piece:
+            continue
+        if pending:
+            piece = f"{pending}\n{piece}"
+            pending = ""
+        if _has_option(piece):
+            segments.append(piece)
+        else:
+            pending = piece          # a stem still waiting for its options
+    if pending:
+        if segments:
+            segments[-1] = f"{segments[-1]}\n{pending}"
+        else:
+            segments.append(pending)
+
+    if len(segments) < 2:
+        return whole()
+
+    # The preamble before the first question — a clinical vignette's patient.
+    lead = "\n".join(lines[: starts[0]]).strip() or remembered_context
+    if lead:
+        segments = [f"{lead}\n\n{s}" for s in segments]
+    return segments[:RAG_MAX_QUESTIONS]
 
 
 def _llm_is_new_case(
@@ -483,6 +726,49 @@ def _build_contents(
     return contents
 
 
+def _fanout_case_description(
+    questions: List[Dict[str, Any]],
+    seed: str = "",
+    clinical: bool = False,
+) -> List[Dict[str, Any]]:
+    """
+    Give every question of a clinical case its context back.
+
+    The model now writes the case text ONCE — on the first question of the case
+    — and leaves `caseDescription` empty on the rest. Re-typing a 150-word
+    patient presentation for each of five questions was pure decode time, and
+    decode is what the corrector actually waits on.
+
+    Storage is deliberately unchanged: each row still carries its own
+    `clinicalCasePartDescription`, so the student app and the translation table
+    see exactly what they saw before. Only the GENERATION is deduplicated —
+    copying a string server-side costs nothing.
+
+    Runs before `classify`, not after: that node ranks each question on
+    `caseDescription + description`, so parts 2..n stripped of their context
+    would get worse course suggestions. Those re-injected tokens are prefill,
+    which is not what makes the corrector wait.
+
+    `seed` is the remembered context of a case already in progress, so a partial
+    submission ("3. …" on its own) inherits it too.
+    """
+    last = (seed or "").strip()
+    for q in questions:
+        current = (q.get("caseDescription") or "").strip()
+        if current:
+            last = current
+            continue
+        if not last:
+            continue
+        # Clinical mode: the whole submission belongs to the remembered case.
+        # Otherwise demand the model's explicit membership flag — without it a
+        # standalone question pasted after a case would inherit someone else's
+        # patient presentation, and students would see it.
+        if clinical or q.get("caseIndex") is not None:
+            q["caseDescription"] = last
+    return questions
+
+
 def _generate(state: CorrectionState) -> CorrectionState:
     """Correct the pasted question(s). Web-search → markdown; else → question list."""
     use_web_search = bool(state.get("use_web_search"))
@@ -491,8 +777,12 @@ def _generate(state: CorrectionState) -> CorrectionState:
     # Ground on retrieved course material when the KB node ran.
     system_prompt = state.get("system_prompt", "")
     context = state.get("context") or ""
-    print(f"\n[DEBUG GENERATE] context length: {len(context)} chars")
-    print(f"[DEBUG GENERATE] context preview: {context[:300]}..." if context else "[DEBUG GENERATE] NO CONTEXT (empty)")
+    mode = "recherche web" if use_web_search else "structuré"
+    if state.get("clinical_case"):
+        mode += " · cas clinique"
+    kb = f"contexte KB {len(context)} car." if context else "AUCUN contexte KB"
+    _rule("CORRECTION", "═")
+    _log(f"  mode : {mode} · {kb}")
     if context:
         system_prompt += (
             "\n\nInstruction de source · Base de connaissances\n"
@@ -506,7 +796,7 @@ def _generate(state: CorrectionState) -> CorrectionState:
             "question, laisse le champ `source` VIDE ou NULL.\n\n"
             f"{context}"
         )
-        print(f"[DEBUG GENERATE] System prompt with KB context: {len(system_prompt)} chars total")
+        _log(f"  prompt système + contexte KB : {len(system_prompt)} car. au total")
 
     # Clinical mode: prepend the remembered case context so a partial submission
     # (e.g. just "3. …") is corrected WITH the full patient background.
@@ -558,8 +848,11 @@ def _generate(state: CorrectionState) -> CorrectionState:
             "circulaire. "
             "Renseigne aussi « globalComment » : une SYNTHÈSE pédagogique destinée à "
             "l'étudiant (affichée après sa réponse) — le raisonnement qui permet de "
-            "trancher, et si c'est pertinent un petit tableau comparatif en HTML "
-            "(<table>, <tr>, <td>). N'y recopie pas les explications option par option. "
+            "trancher, et si c'est pertinent un petit tableau comparatif en MARKDOWN "
+            "(ligne d'en-tête « | Critère | A | B | », puis « |---|---|---| », puis les "
+            "lignes de données). N'utilise JAMAIS de balises HTML : elles sont "
+            "converties automatiquement à l'affichage. "
+            "N'y recopie pas les explications option par option. "
             "Laisse-le vide (\"\") si la question ne s'y prête pas. Le champ "
             "« explanation » au niveau de la question reste réservé aux ALERTES "
             "(« ⚠️ CONFLIT CLÉ : », « ⚠️ AMBIGUË : », « ⚠️ INCERTAIN : », « ⚠️ TEXTE : ») "
@@ -591,8 +884,17 @@ def _generate(state: CorrectionState) -> CorrectionState:
         )
         questions = _parse_questions(raw)
         if questions:
-            return {"questions": questions, "reply": ""}
+            _log(f"  ✓ {len(questions)} question(s) structurée(s)")
+            _rule("", "═")
+            return {
+                "questions": _fanout_case_description(
+                    questions, case_context, bool(state.get("clinical_case"))
+                ),
+                "reply": "",
+            }
         # Structuring failed → show the grounded analysis as markdown.
+        _log("  ⚠ structuration impossible — renvoi de l'analyse en markdown")
+        _rule("", "═")
         return {"questions": [], "reply": research or "No response generated"}
 
     # No web search: enforce the JSON array with responseSchema (most reliable).
@@ -607,8 +909,16 @@ def _generate(state: CorrectionState) -> CorrectionState:
     )
     questions = _parse_questions(raw)
     if questions:
-        return {"questions": questions, "reply": ""}
-    print("[correction_graph] structured parse failed")
+        _log(f"  ✓ {len(questions)} question(s) structurée(s)")
+        _rule("", "═")
+        return {
+            "questions": _fanout_case_description(
+                questions, case_context, bool(state.get("clinical_case"))
+            ),
+            "reply": "",
+        }
+    _log("  ⚠ échec de l'analyse JSON — réponse brute renvoyée")
+    _rule("", "═")
     return {"questions": [], "reply": raw or "No response generated"}
 
 
