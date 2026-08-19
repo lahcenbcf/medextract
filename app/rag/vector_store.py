@@ -234,6 +234,33 @@ def delete_by_metadata(metadata: Dict[str, Any]) -> None:
     get_client().delete(collection_name=COLLECTION, points_selector=flt)
 
 
+def retag_file_url(source: str, file_url: str) -> int:
+    """
+    Point a document's chunks at a new stored location.
+
+    The payload carries `file_url`, and that is what the admin clicks to open a
+    cited page. Move the file on storage without rewriting it and every citation
+    for that book leads to a 404 — the retrieval still works, the evidence
+    behind it just stops being reachable.
+
+    Returns how many chunks were retagged, so a caller can tell a real update
+    from a silent no-match.
+    """
+    flt = build_filter({"source": source})
+    if flt is None:
+        return 0
+    ensure_collection()
+    client = get_client()
+    matched = client.count(collection_name=COLLECTION, count_filter=flt).count
+    if matched:
+        client.set_payload(
+            collection_name=COLLECTION,
+            payload={"file_url": file_url},
+            points=flt,
+        )
+    return matched
+
+
 def list_sources() -> List[Dict[str, Any]]:
     """
     List indexed documents grouped by their `source` (the uploaded filename),

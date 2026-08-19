@@ -614,6 +614,32 @@ class RagSearchRequest(BaseModel):
     topK: int = 5
 
 
+class RetagUrlRequest(BaseModel):
+    source: str
+    file_url: str
+
+
+@app.post("/rag/retag-url")
+def rag_retag_url(req: RetagUrlRequest):
+    """
+    Point an indexed document's chunks at a new stored location.
+
+    Needed because the storage path and the search index hold the same URL in
+    two places: move the file and the citations keep pointing at where it used
+    to be. z_api owns the move (it has the database) but cannot reach Qdrant, so
+    it calls this once the new copy is in place.
+    """
+    if not req.source.strip() or not req.file_url.strip():
+        raise HTTPException(status_code=400, detail="source and file_url are required")
+    from app.rag.vector_store import retag_file_url
+
+    try:
+        updated = retag_file_url(req.source.strip(), req.file_url.strip())
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Retag failed: {exc}")
+    return {"source": req.source, "chunks": updated}
+
+
 @app.post("/rag/search")
 def rag_search(req: RagSearchRequest):
     """Metadata-filtered semantic search, auto-merged to parent sections."""

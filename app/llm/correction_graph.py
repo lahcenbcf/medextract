@@ -857,9 +857,16 @@ def _generate(state: CorrectionState) -> CorrectionState:
             "« explanation » au niveau de la question reste réservé aux ALERTES "
             "(« ⚠️ CONFLIT CLÉ : », « ⚠️ AMBIGUË : », « ⚠️ INCERTAIN : », « ⚠️ TEXTE : ») "
             "et vaut \"\" s'il n'y a rien à signaler. "
-            "Termine CHAQUE explication par « Source : <URL> » avec une URL RÉELLE de "
-            "la liste SOURCES WEB ci-dessus (jamais inventée) ; si la liste est vide, "
-            "n'ajoute aucune mention de source."
+            # No source line, and no `source` field either. Grounded search
+            # returned URLs too generic to be worth reading — a publisher's home
+            # page rather than the passage backing the point — and this
+            # instruction wrote them INTO the explanation, so every student saw
+            # them. Said explicitly rather than merely omitted: the research
+            # pass above still carries a "SOURCES WEB" list, and left to itself
+            # the model appends citations from it out of habit.
+            "N'ajoute AUCUNE mention de source : ni ligne « Source : … » à la fin "
+            "d'une explication, ni URL dans le texte. Laisse le champ « source » "
+            "de chaque option VIDE."
         )
         struct_contents = [
             {
